@@ -527,6 +527,60 @@ def on_start(ctx):
 >
 > `role_id` 会先校验存在性再动手，所以写错 id 只会拿到 `ok: false`，不会先把你的对话清空。
 
+### 台词历史（上下文源）：`read_context` / `edit_context` / `compress_context`
+
+这三个函数操作**当前对话的台词历史**（内部叫 `line_list`）——即「LLM 上下文」的**源**：每轮发给 LLM 的上下文都是它按各角色视角渲染出来的。三点务必记牢：
+
+- 下标按**台词行**算（不是渲染后的 LLM 消息），**从 1 开始、闭区间**，第 1 条通常就是 role system 的人设行。
+- 改的是**全局历史**：影响所有角色看到的上下文 + 界面显示的历史 + 存档。
+- 正在生成回复时 `edit_context` 会被**拒绝**（避免和流式写入打架）。
+
+**`read_context(start=None, end=None)`** — 读第 `start`~`end` 条，**省略 = 整段**。
+
+返回 `{ "ok": true, "total": N, "lines": [ ... ] }`。每行字段齐全：`id`（未存盘的可能为 null）、`content`、`original_emotion`、`predicted_emotion`、`tts_content`、`action_content`、`audio_file`、`thinking`、`tool_call`、`attribute`、`sender_role_id`、`display_name`、`perceived_role_ids`。
+
+> `attribute` 取值是 `"System"` / `"User"` / `"Assistant"` / `"Tool"`（首字母大写）。
+
+```python
+from plugin_host import read_context
+
+r = read_context()                 # 整段
+r = read_context(start=1, end=3)   # 第 1~3 条（含人设行）
+for line in r["lines"]:
+    print(line["attribute"], line["display_name"], line["content"])
+```
+
+**`edit_context(replacement, start=None, end=None)`** — 用 `replacement`（**台词行 dict 列表**）替换第 `start`~`end` 条，**省略区间 = 整段**。
+
+- 条数不限：比被替换区间**少**即合并（如 3 行写 1 行）、**多**即展开；传**空列表**即删除该区间。
+- 每个 dict 必须**字段齐全**（最省事是拿 `read_context` 的输出改）。**不带 `id` 的行会按位置继承被替换行的 id**，保住存档链锚点，一般不用自己填。
+- System 人设行**可以编辑 / 删除**；删掉后该角色上下文就没有 system 前缀了（宿主只记一条警告，不拦截）。
+- **落库要等存盘**：本函数只改内存并立刻刷新上下文，写进存档是之后正常存盘（手动 / 自动存档）的事。
+
+返回 `{ "ok": true, "removed": N, "total": M }`（`removed` = 被替换掉的条数）；生成中返回 `{ "ok": false, "error": "正在生成回复，暂不能编辑历史，请稍后再试" }`。
+
+```python
+from plugin_host import read_context, edit_context
+
+# 把第 1~3 条合并成 1 条旁白
+lines = read_context(start=1, end=3)["lines"]
+merged = lines[0]
+merged["content"] = "（把前面三句合成了一句）"
+merged["attribute"] = "User"
+r = edit_context([merged], start=1, end=3)   # {"ok": True, "removed": 3, "total": ...}
+```
+
+**`compress_context()`** — 立刻触发一次永久记忆压缩并**等它完成**再返回（只压达到阈值的角色；没开永久记忆 / 没配 LLM / 没到阈值都直接返回）。相当于「把这段剧情沉进长期记忆」的显式触发点，会调用若干次 LLM，**可能耗时数秒**。
+
+返回 `{ "ok": true, "triggered": N }`（`N` = 实际触发压缩的角色数，0 = 无需压缩）。
+
+```python
+from plugin_host import compress_context
+r = compress_context()   # {"ok": True, "triggered": 1}
+```
+
+> **和永久记忆的关系**：如果永久记忆已经把早期台词压缩成了摘要，那些行**仍在历史里，但发给 LLM 的是摘要**——只改行对 LLM 无效（system 人设行除外）。`edit_context` 会自动把压缩指针回拨到编辑处，让这段重新进入上下文；随后的压缩把改动重新摘要进去。代价是**逐字内容会被 LLM 改写成摘要**，所以想保留原文就别在改动后紧接着压缩。
+
 ## 完整示例
 
 一个「查询并汇报当前状态」的插件：
