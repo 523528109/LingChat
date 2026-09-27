@@ -201,6 +201,37 @@ r = read_data_file("game_data/characters/风雪/avatar/高兴.webp")
 - 单个文件上限 64MB，超了返回 `ok: false`
 - 失败不抛异常，按返回值处理即可；`error` 里只有你自己给的相对路径，不会带宿主绝对路径
 - 目录名和角色显示名不一定一样（立绘目录由角色数据决定），插件侧别按显示名硬拼
+## 定时任务：`[[schedule]]`
+
+需要周期性做点什么（轮询外部服务、定时上报…）时用这个。和 `[startup]` 的分工：
+startup 只在程序启动 / 插件启用时跑一次（带重试），定时任务会一直按间隔跑，
+插件一停就跟着停。
+
+```toml
+[[schedule]]
+script = "poll.py"       # 相对插件目录的单个文件名
+handler = "on_tick"      # 脚本内的处理函数，签名 handler(ctx)
+interval_ms = 2000       # 必填，范围 500 ~ 600000
+timeout_ms = 15000       # 可选，单次执行超时，默认 30000，上限 120000
+```
+
+```python
+# data/plugins/my_poller/poll.py
+from plugin_host import http_get
+
+
+def on_tick(ctx):
+    r = http_get("http://127.0.0.1:8080/pending", timeout_ms=5000)
+    for item in (r.get("body") or {}).get("messages") or []:
+        ...  # 想送进对话就调 send_user_message
+```
+
+约定与限制：
+
+- handler 的 `ctx` 与启动入口一致（`config` / `env` / `call_tool`）
+- 单次超时只放弃「等它」，中断不了已经跑起来的脚本（和信号 handler 一样）
+- 插件被禁用 / 删除后循环立刻停；重新启用会重新起
+- 同一插件的多个定时任务之间并发执行，没有顺序保证
 
 ## 订阅宿主信号：`[[subscribe]]`
 

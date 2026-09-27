@@ -136,6 +136,23 @@ fn default_retry_interval_ms() -> u64 {
     5_000
 }
 
+/// 插件定时任务声明：按 `interval_ms` 周期执行。
+///
+/// 与 `[startup]` 的分工：startup 是「程序启动 / 插件启用时跑一次」（带重试），
+/// 定时任务是长期周期执行，插件一停就跟着停。ctx 与启动入口一致。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleDecl {
+    /// 处理脚本（相对插件目录的单个文件名）。
+    pub script: String,
+    /// 脚本内的处理函数名，签名为 `handler(ctx)`。
+    pub handler: String,
+    /// 执行间隔（毫秒）。
+    pub interval_ms: u64,
+    /// 单次执行的超时（毫秒），默认 30s。
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -197,6 +214,9 @@ pub struct PluginManifest {
     /// 启动（或启用）时执行的入口。
     #[serde(default)]
     pub startup: Option<StartupDecl>,
+    /// 定时任务（空 = 没有周期任务）。插件停用即停。
+    #[serde(default)]
+    pub schedule: Vec<ScheduleDecl>,
     /// 前置插件 id：这些插件必须已安装且已启用，本插件才能启用；
     /// 启动时也会等它们的启动函数执行完再执行自己的。与是否有启动函数无关。
     #[serde(default)]

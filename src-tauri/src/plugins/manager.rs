@@ -20,7 +20,8 @@ use super::resources::{self, PluginResourceEntry};
 use super::signal::SignalRegistry;
 use super::tool::PluginTool;
 use super::types::{
-    ConfigKind, PluginInfo, PluginRecord, PluginRunEnv, PluginState, ResourceKind, StartupDecl,
+    ConfigKind, PluginInfo, PluginRecord, PluginRunEnv, PluginState, ResourceKind, ScheduleDecl,
+    StartupDecl,
 };
 
 /// 集中插件状态文件名（data/plugins/state.json，仿 tool_permissions.toml）。
@@ -46,6 +47,9 @@ pub struct PluginManager {
     /// 也会先查一次。注意它取消的是**等待**，不是正在执行的脚本——阻塞线程里的
     /// 解释器没有任何外部中断手段，只能等它自己返回并丢弃结果。
     cancels: Mutex<HashMap<String, CancellationToken>>,
+    /// 已经起了定时循环的插件 id。重复调用 `start_schedules`（启动 + 每次启停
+    /// / 重载都会调）时靠它防重复；令牌重建与停用时清空。
+    schedules: Mutex<HashSet<String>>,
 }
 
 impl PluginManager {
@@ -60,6 +64,7 @@ impl PluginManager {
             records: Mutex::new(HashMap::new()),
             signals: RwLock::new(SignalRegistry::new()),
             cancels: Mutex::new(HashMap::new()),
+            schedules: Mutex::new(HashSet::new()),
         };
         manager.sync_state_file();
         manager.reload();
@@ -125,6 +130,9 @@ impl PluginManager {
                     cancels.insert(record.manifest.id.clone(), CancellationToken::new());
                 }
             }
+            // 令牌全换了一遍，旧的定时循环会在下一次 await 时看到取消并退出，
+            // 这里同步清掉「已启动」标记，让 start_schedules 重新起。
+            self.schedules.blocking_lock().clear();
         }
     }
 
@@ -1043,6 +1051,58 @@ impl PluginManager {
         if let Some(token) = self.cancels.lock().await.remove(id) {
             token.cancel();
         }
+        self.schedules.lock().await.remove(id);
+    }
+
+    /// 给「启用且声明了定时任务」的插件起循环。
+    ///
+    /// 程序启动时、以及每次启停 / 重载之后调用。重复调用安全：已经在跑的插件会被
+    /// 跳过；插件被停用时令牌被取消，循环在下一次等待处自己退出。
+    pub async fn start_schedules(&self, app: &AppHandle) {
+        let pending: Vec<(String, PathBuf, Vec<ScheduleDecl>)> = {
+            let records = self.records.lock().await;
+            records
+                .values()
+                .filter(|r| r.state.enabled && r.error.is_none() && !r.manifest.schedule.is_empty())
+                .map(|r| {
+                    (
+                        r.manifest.id.clone(),
+                        r.dir.clone(),
+                        r.manifest.schedule.clone(),
+                    )
+                })
+                .collect()
+        };
+
+        for (id, dir, decls) in pending {
+            let Some(token) = self.live_token(&id).await else {
+                continue; // 已停用
+            };
+            if !self.schedules.lock().await.insert(id.clone()) {
+                continue; // 已经在跑
+            }
+            for decl in decls {
+                let app = app.clone();
+                let id = id.clone();
+                let dir = dir.clone();
+                let token = token.clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = token.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_millis(decl.interval_ms)) => {},
+                        }
+                        if token.is_cancelled() {
+                            break;
+                        }
+                        if let Err(e) = run_schedule_once(&app, &id, &dir, &decl, &token).await {
+                            tracing::warn!(plugin = %id, "定时任务执行失败: {e}");
+                        }
+                    }
+                });
+            }
+            tracing::info!(plugin = %id, "定时任务已启动");
+        }
     }
 
     /// 插件是否已停用（令牌不存在，或已被取消）。
@@ -1163,5 +1223,43 @@ fn coerce_config_value(kind: &ConfigKind, value: &serde_json::Value) -> Option<s
             },
             _ => None,
         },
+    }
+}
+
+/// 跑一次定时任务。超时只放弃「等它」，阻塞线程里的解释器中断不了——
+/// 这点和启动入口、信号 handler 一致。
+async fn run_schedule_once(
+    app: &AppHandle,
+    id: &str,
+    dir: &Path,
+    decl: &ScheduleDecl,
+    token: &CancellationToken,
+) -> Result<(), String> {
+    let script_path = dir.join(&decl.script);
+    let handler = decl.handler.clone();
+    let timeout = Duration::from_millis(decl.timeout_ms);
+    let plugin_id = id.to_string();
+    let app_handle = app.clone();
+    let token = token.clone();
+
+    let joined = tokio::time::timeout(
+        timeout,
+        tokio::task::spawn_blocking(move || {
+            // 起解释器前最后一道闸：刚被停用的插件不再白跑一次。
+            if token.is_cancelled() {
+                return Err("插件已被停用".to_string());
+            }
+            let manager = app_handle.state::<AppState>().data().plugin_manager.clone();
+            let run_env = manager.plugin_run_env(&plugin_id);
+            python_backend::run_plugin_startup(&script_path, &handler, run_env, app_handle)
+        }),
+    )
+    .await;
+
+    match joined {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(e))) => Err(e),
+        Ok(Err(e)) => Err(format!("任务线程异常: {e}")),
+        Err(_) => Err(format!("执行超时（{}ms）", decl.timeout_ms)),
     }
 }

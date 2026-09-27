@@ -65,6 +65,12 @@ const MAX_STARTUP_RETRIES: u64 = 5;
 /// 重试间隔上限（毫秒）。
 const MAX_RETRY_INTERVAL_MS: u64 = 60_000;
 
+/// 定时任务的最短间隔（毫秒）。再快就是在拿 CPU 换「实时」，不值当。
+const MIN_SCHEDULE_INTERVAL_MS: u64 = 500;
+
+/// 定时任务的最长间隔（毫秒）：超过 10 分钟就不像「定时」了。
+const MAX_SCHEDULE_INTERVAL_MS: u64 = 600_000;
+
 /// id 的字符集校验（插件 id 与前置插件名共用）。
 fn is_valid_plugin_id(id: &str) -> bool {
     !id.is_empty()
@@ -89,9 +95,10 @@ pub fn validate(manifest: &PluginManifest) -> Result<()> {
         && manifest.resources.is_empty()
         && manifest.subscribe.is_empty()
         && manifest.startup.is_none()
+        && manifest.schedule.is_empty()
     {
         anyhow::bail!(
-            "插件 '{}' 未声明任何工具、资源、信号订阅或启动入口",
+            "插件 '{}' 未声明任何工具、资源、信号订阅、启动入口或定时任务",
             manifest.id
         );
     }
@@ -178,6 +185,27 @@ pub fn validate(manifest: &PluginManifest) -> Result<()> {
             );
         }
         validate_timeout(&manifest.id, &owner, sub.timeout_ms)?;
+    }
+    for sched in &manifest.schedule {
+        let owner = "定时任务".to_string();
+        validate_script_name(&manifest.id, &owner, &sched.script)?;
+        if !is_valid_handler_name(&sched.handler) {
+            anyhow::bail!(
+                "插件 '{}' {owner} 的处理函数名 '{}' 不是合法标识符",
+                manifest.id,
+                sched.handler
+            );
+        }
+        if !(MIN_SCHEDULE_INTERVAL_MS..=MAX_SCHEDULE_INTERVAL_MS).contains(&sched.interval_ms) {
+            anyhow::bail!(
+                "插件 '{}' 定时任务的间隔 {}ms 超出 {}..={} 范围",
+                manifest.id,
+                sched.interval_ms,
+                MIN_SCHEDULE_INTERVAL_MS,
+                MAX_SCHEDULE_INTERVAL_MS
+            );
+        }
+        validate_timeout(&manifest.id, &owner, sched.timeout_ms)?;
     }
     Ok(())
 }

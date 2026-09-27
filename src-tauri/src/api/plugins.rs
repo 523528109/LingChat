@@ -42,6 +42,8 @@ pub async fn plugin_set_enabled(app: AppHandle, id: String, enabled: bool) -> Re
             startup_manager
                 .run_startup_hook_for(&app_handle, &startup_id)
                 .await;
+            // 启用的插件可能带定时任务；已经在跑的其他插件会被跳过。
+            startup_manager.start_schedules(&app_handle).await;
         });
     } else {
         plugin_manager.cascade_disable_dependents(&app, &id).await;
@@ -75,6 +77,7 @@ pub async fn plugin_reload(app: AppHandle) -> Result<(), String> {
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         plugin_manager.run_startup_hooks(&app_handle).await;
+        plugin_manager.start_schedules(&app_handle).await;
     });
     Ok(())
 }

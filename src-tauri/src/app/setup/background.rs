@@ -59,6 +59,8 @@ pub(super) fn run(
         let app_handle = app.handle().clone();
         tauri::async_runtime::spawn(async move {
             plugin_manager.run_startup_hooks(&app_handle).await;
+            // 启动入口跑完再起定时任务：依赖顺序由启动阶段保证。
+            plugin_manager.start_schedules(&app_handle).await;
         });
     }
 
