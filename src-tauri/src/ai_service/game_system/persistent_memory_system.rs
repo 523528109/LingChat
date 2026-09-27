@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use anyhow::Result;
 use serde::Serialize;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::ai_service::game_system::memory_builder::MemoryBuilder;
 use crate::ai_service::llm::{LlmClient, LlmSlot, slot_snapshot};
@@ -168,6 +168,8 @@ pub struct PersistentMemorySystem {
     history_revision: Arc<AtomicU64>,
     /// 把历史失效与后台成功/失败提交放进同一同步边界，封闭最终 revision 检查的 TOCTOU。
     commit_gate: Arc<std::sync::Mutex<()>>,
+    /// 后台压缩结束时的唤醒源：`compress_if_needed` 靠它等到本轮压缩落回来。
+    idle_notify: Arc<Notify>,
 
     /// 最近一次压缩失败的时间戳（unix 毫秒），0 = 无失败。用于重试冷却。
     last_failure_at_ms: Arc<AtomicU64>,
@@ -185,11 +187,14 @@ pub struct PersistentMemorySystem {
 }
 
 /// 无论后台任务成功、显式失败还是 panic 展开，都解除 updating 锁。
-struct UpdatingGuard(Arc<AtomicBool>);
+struct UpdatingGuard(Arc<AtomicBool>, Arc<Notify>);
 
 impl Drop for UpdatingGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+        // 唤醒可能正卡在 `wait_until_idle` 的调用方。无等待者时 notify_one 会
+        // 存下一个 permit，兜住「判空后、await 前刚好完成」的漏唤醒竞态。
+        self.1.notify_one();
     }
 }
 
@@ -262,6 +267,7 @@ impl PersistentMemorySystem {
             has_pending: Arc::new(AtomicBool::new(false)),
             history_revision: Arc::new(AtomicU64::new(0)),
             commit_gate: Arc::new(std::sync::Mutex::new(())),
+            idle_notify: Arc::new(Notify::new()),
             last_failure_at_ms: Arc::new(AtomicU64::new(0)),
             fail_count: Arc::new(AtomicU32::new(0)),
             enabled,
@@ -316,6 +322,20 @@ impl PersistentMemorySystem {
             }
         }
         start
+    }
+
+    /// 把压缩指针回拨到 `idx`（仅当当前指针在其之后）。用于编辑台词历史后让被
+    /// 编辑区间重新进入渲染窗口、并在下次压缩时重新摘要。
+    ///
+    /// 回拨会置 `has_pending`，使新指针经 `sync_to_role` 同步进 `role.memory_bank`，
+    /// 进而被 `persist_memory_banks_to_db` 落库；否则存盘写回的仍是旧指针。
+    pub async fn rewind_pointer(&self, idx: usize) {
+        let mut bank = self.memory_bank.lock().await;
+        if bank.meta.last_processed_global_idx.max(0) as usize > idx {
+            bank.meta.last_processed_global_idx = idx as i64;
+            bank.meta.updated_at = now_str();
+            self.has_pending.store(true, Ordering::Release);
+        }
     }
 
     /// 长期记忆 / 用户画像 / 约定 文本（适合合并到 system 消息）。
@@ -436,6 +456,38 @@ impl PersistentMemorySystem {
         self.spawn_background_update(chat_text, target_idx, history_revision);
     }
 
+    /// 达到压缩阈值就同步跑一次压缩并**等它完成**；未达阈值 / 冷却中 / 区间对该
+    /// 角色不可见时立即返回。返回是否实际触发了压缩。
+    ///
+    /// 与后台自动压缩共用同一套判定（`check_and_trigger_auto_update`），区别只是
+    /// 把「spawn 完就不管」换成「等回来」。若调用时已有压缩在跑，会先等它结束再
+    /// 重新判定，确保返回时该角色没有「待压缩」的积压。
+    ///
+    /// 会 `await` 若干次 LLM 调用，**不要在持有 `game_status` 锁时调用**。
+    pub async fn compress_if_needed(&self, all_lines: &[GameLine]) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let mut triggered = false;
+        loop {
+            // 已有压缩在跑就先等它落回来，避免叠加判定。
+            self.wait_until_idle().await;
+            self.check_and_trigger_auto_update(all_lines);
+            if !self.is_updating.load(Ordering::Acquire) {
+                return triggered;
+            }
+            // 触发成功 → 回到循环开头等它完成，再判定是否还有新积压。
+            triggered = true;
+        }
+    }
+
+    /// 等到当前这轮后台压缩结束；没有在跑时立即返回。
+    async fn wait_until_idle(&self) {
+        while self.is_updating.load(Ordering::Acquire) {
+            self.idle_notify.notified().await;
+        }
+    }
+
     // ── 内部方法 ──
 
     fn spawn_background_update(
@@ -453,12 +505,13 @@ impl PersistentMemorySystem {
         let commit_gate = self.commit_gate.clone();
         let last_failure_at_ms = self.last_failure_at_ms.clone();
         let fail_count = self.fail_count.clone();
+        let idle_notify = self.idle_notify.clone();
         let role_id = self.role_id;
         let ai_name = self.ai_name.clone();
         let limits = self.section_limits;
 
         tokio::spawn(async move {
-            let _updating_guard = UpdatingGuard(is_updating.clone());
+            let _updating_guard = UpdatingGuard(is_updating.clone(), idle_notify);
             // 仅当前历史版本的失败才进入冷却；过期任务不能污染新会话的重试状态。
             let record_failure = || {
                 if !record_failure_if_current(

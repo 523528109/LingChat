@@ -3,7 +3,8 @@
 //! 两类能力：
 //! - **HTTP**：`http_get` / `http_post`，复用 `factory::build_http_client`
 //!   （webpki-roots，Android 兼容），返回 `{ status, ok, body }`。
-//! - **宿主控制**：`switch_character`，完整切换当前角色。
+//! - **宿主控制**：`switch_character`（完整切换当前角色）、以及台词历史（上下文
+//!   源）的 `read_context` / `edit_context` / `compress_context`。
 //!
 //! 这是**插件专属**面——LLM 拿不到，与 `ctx["call_tool"]` 那条共用通道相对。
 //! 新增宿主能力时，`#[pyfunction]` 直接加在下面的 `plugin_host` 模块里，
@@ -20,6 +21,8 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::AppState;
 use crate::ai_service::llm::factory;
+use crate::ai_service::tools::game_status_handle;
+use crate::ai_service::types::GameLine;
 use crate::db::managers::role_repo::RoleRepo;
 
 /// 全局共享的 reqwest Client（连接池复用，进程内单例）。
@@ -205,10 +208,97 @@ async fn switch_character_impl(app: AppHandle, role_id: i32) -> serde_json::Valu
     }
 }
 
+// ── 台词历史（上下文源）的读取 / 编辑 / 压缩 ──
+
+/// 宿主句柄未初始化时的统一返回（插件在 setup 完成前被调用）。
+fn no_host(vm: &VirtualMachine) -> PyObjectRef {
+    value_to_pyobject(
+        vm,
+        &serde_json::json!({ "ok": false, "error": "宿主句柄未初始化" }),
+    )
+}
+
+/// 解析 kwargs 里的 `start` / `end`（1 起、闭区间；缺省 = 整段，由 impl 补）。
+fn kw_range(
+    vm: &VirtualMachine,
+    kwargs: &HashMap<String, PyObjectRef>,
+) -> (Option<usize>, Option<usize>) {
+    let get = |key: &str| {
+        kwargs
+            .get(key)
+            .and_then(|v| py_to_value(vm, v).as_u64())
+            .map(|n| n as usize)
+    };
+    (get("start"), get("end"))
+}
+
+/// 读取第 `start`~`end` 条台词，缺省整段。
+async fn read_context_impl(
+    app: AppHandle,
+    start: Option<usize>,
+    end: Option<usize>,
+) -> serde_json::Value {
+    let gs = game_status_handle(&app).await;
+    let gs = gs.lock().await;
+    let total = gs.line_list.len();
+    let lines = gs.read_context_lines(start.unwrap_or(1), end.unwrap_or(total));
+    serde_json::json!({ "ok": true, "total": total, "lines": lines })
+}
+
+/// 用 `replacement` 替换第 `start`~`end` 条台词，缺省整段。
+async fn edit_context_impl(
+    app: AppHandle,
+    start: Option<usize>,
+    end: Option<usize>,
+    replacement: Vec<GameLine>,
+) -> serde_json::Value {
+    let state = app.state::<AppState>();
+    let db = state.db.clone();
+    let generation_lock = state.generation_lock.clone();
+    let gs = game_status_handle(&app).await;
+    let mut gs = gs.lock().await;
+    let total = gs.line_list.len();
+    match gs
+        .edit_context_lines(
+            &db,
+            &generation_lock,
+            start.unwrap_or(1),
+            end.unwrap_or(total),
+            replacement,
+        )
+        .await
+    {
+        Ok(removed) => {
+            serde_json::json!({ "ok": true, "removed": removed, "total": gs.line_list.len() })
+        },
+        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+    }
+}
+
+/// 触发并等待一次永久记忆压缩；只压达到阈值的角色。
+async fn compress_context_impl(app: AppHandle) -> serde_json::Value {
+    // 短锁：只取句柄 + 台词快照，随后在锁外 await 压缩，
+    // 避免压缩（若干次 LLM 调用）期间一直冻住 GameStatus。
+    let (handles, lines) = {
+        let gs = game_status_handle(&app).await;
+        let gs = gs.lock().await;
+        (gs.role_manager.memory_bank_handles(), gs.line_list.clone())
+    };
+    let mut triggered = 0usize;
+    for handle in handles {
+        if handle.compress_if_needed(&lines).await {
+            triggered += 1;
+        }
+    }
+    serde_json::json!({ "ok": true, "triggered": triggered })
+}
+
 /// 插件宿主原生模块。插件脚本里用 `from plugin_host import ...` 取用。
 #[pymodule]
 mod plugin_host {
     use rustpython_vm::{PyObjectRef, PyResult, VirtualMachine, function::KwArgs};
+
+    use crate::ai_service::types::GameLine;
 
     /// 执行 HTTP GET。
     ///
@@ -270,6 +360,73 @@ mod plugin_host {
             ));
         };
         let result = super::runtime().block_on(super::switch_character_impl(app, role_id));
+        Ok(super::value_to_pyobject(vm, &result))
+    }
+
+    /// 读取台词历史（上下文源）第 start~end 条，缺省整段。
+    ///
+    /// 用法：`read_context()`（整段）/ `read_context(start=1, end=3)`
+    ///
+    /// 返回 `{ "ok": true, "total": N, "lines": [ {全字段行} ] }`。
+    /// 行 dict 携带全部字段（内容、情绪、动作、TTS、音频、thinking、tool_call、
+    /// 感知集合等），可直接改后交给 `edit_context`。
+    #[pyfunction]
+    fn read_context(kwargs: KwArgs<PyObjectRef>, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+        let kwargs = super::kwargs_map(kwargs);
+        let (start, end) = super::kw_range(vm, &kwargs);
+        let Some(app) = crate::plugins::app_handle() else {
+            return Ok(super::no_host(vm));
+        };
+        let result = super::runtime().block_on(super::read_context_impl(app, start, end));
+        Ok(super::value_to_pyobject(vm, &result))
+    }
+
+    /// 用 `replacement` 替换第 start~end 条台词，缺省整段。
+    ///
+    /// 用法：`edit_context(new_lines)` / `edit_context(new_lines, start=1, end=3)`
+    ///
+    /// `replacement` 是行 dict 列表，**每个 dict 需含全部字段**（最省事是拿
+    /// `read_context` 的输出改）。条数不限：空列表 = 删除该区间，多条 = 展开。
+    /// 返回 `{ "ok": true, "removed": N, "total": M }` 或 `{ "ok": false, "error": ... }`。
+    #[pyfunction]
+    fn edit_context(
+        replacement: PyObjectRef,
+        kwargs: KwArgs<PyObjectRef>,
+        vm: &VirtualMachine,
+    ) -> PyResult<PyObjectRef> {
+        let kwargs = super::kwargs_map(kwargs);
+        let (start, end) = super::kw_range(vm, &kwargs);
+        let lines: Vec<GameLine> =
+            match serde_json::from_value(super::py_to_value(vm, &replacement)) {
+                Ok(lines) => lines,
+                Err(e) => {
+                    return Ok(super::value_to_pyobject(
+                        vm,
+                        &serde_json::json!({
+                            "ok": false,
+                            "error": format!("replacement 解析为台词行失败: {e}"),
+                        }),
+                    ));
+                },
+            };
+        let Some(app) = crate::plugins::app_handle() else {
+            return Ok(super::no_host(vm));
+        };
+        let result = super::runtime().block_on(super::edit_context_impl(app, start, end, lines));
+        Ok(super::value_to_pyobject(vm, &result))
+    }
+
+    /// 触发并等待一次永久记忆压缩；只压达到阈值的角色。
+    ///
+    /// 用法：`compress_context()`
+    ///
+    /// 返回 `{ "ok": true, "triggered": N }`（N = 实际触发压缩的角色数，0 = 无需压缩）。
+    #[pyfunction]
+    fn compress_context(vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+        let Some(app) = crate::plugins::app_handle() else {
+            return Ok(super::no_host(vm));
+        };
+        let result = super::runtime().block_on(super::compress_context_impl(app));
         Ok(super::value_to_pyobject(vm, &result))
     }
 }
