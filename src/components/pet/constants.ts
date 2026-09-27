@@ -13,8 +13,19 @@ export const WINDOW_WIDTH_BASE = 264;
 /** 头像带 */
 export const AVATAR_BAND_BASE = 210;
 
-/** 输入带 */
-export const CHAT_BASE_H = 70;
+/**
+ * 输入带高：装得下最胖的输入框（2 行 ≈ 55）**且底部不留空**。
+ *
+ * 这带高直接决定下置气泡的位置：气泡窗顶边贴着宠物窗底边，带内底部留多少空，
+ * 气泡看起来就离输入框多远。所以输入行靠**下**对齐（items-end），多出来的余量
+ * 全部落在输入框与头像之间（那里本来就透明），底部则贴死 —— 换成靠上对齐就会
+ * 在下置时露出一大截空隙。
+ */
+export const CHAT_BASE_H = 64;
+
+/** 输入行距窗口底边留的呼吸量：纯粹给发送键的光晕留地方，不参与气泡定位。
+ *  下置气泡与输入框的实际间隔 = BUBBLE_GAP_BASE + 本值 */
+export const CHAT_BASE_PB = 6;
 
 /** 宠物窗高度：只有头像与输入框 —— 顶边即头像顶边，因此天然贴屏幕顶 */
 export const PET_WINDOW_H_BASE = AVATAR_BAND_BASE + CHAT_BASE_H;

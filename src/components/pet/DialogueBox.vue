@@ -5,13 +5,14 @@
     显隐与动效交给 CSS 类 + 作用域关键帧（见文件末尾 .enter/.leave）。
   -->
   <div
-    class="absolute inset-x-0 bottom-(--tail) z-30 flex cursor-pointer items-end justify-center px-2"
-    :class="visible ? 'enter' : 'leave pointer-events-none'"
+    class="absolute z-30 flex cursor-pointer"
+    :class="[horizontal ? 'w-[85%] flex-col' : 'inset-x-0 justify-center px-2', frameClass]"
     @click="emit('advance')"
   >
     <div
       ref="bubbleRef"
-      class="hover-up relative w-[85%] rounded-[calc(20px*var(--pet-ui-scale,1))] border border-white/10 bg-neutral-950/50 px-[calc(18px*var(--pet-ui-scale,1))] py-[calc(6px*var(--pet-ui-scale,1))] text-white backdrop-blur-xl backdrop-saturate-200 transition-all duration-300 [text-shadow:0_1px_4px_rgba(0,0,0,0.5)] hover:scale-[1.02] hover:border-white/20 hover:bg-neutral-950/65"
+      class="hover-up relative rounded-[calc(20px*var(--pet-ui-scale,1))] border border-white/10 bg-neutral-950/50 px-[calc(18px*var(--pet-ui-scale,1))] py-[calc(6px*var(--pet-ui-scale,1))] text-white backdrop-blur-xl backdrop-saturate-200 transition-all duration-300 [text-shadow:0_1px_4px_rgba(0,0,0,0.5)] hover:scale-[1.02] hover:border-white/20 hover:bg-neutral-950/65"
+      :class="[horizontal ? 'w-full' : 'w-[85%]', animClass]"
       :style="{ maxHeight: `${maxHeight}px` }"
     >
       <div class="relative overflow-hidden">
@@ -32,24 +33,24 @@
         class="dialog-text-lock [scrollbar-width:none] overflow-y-auto pb-[0.4em] text-[calc(15px*var(--pet-ui-scale,1))] leading-snug font-medium break-all whitespace-pre-line [text-shadow:0_0_3px_rgba(0,0,0,0.9),0_1px_4px_rgba(0,0,0,0.5)] [&::-webkit-scrollbar]:hidden"
       ></div>
 
-      <!-- 长尾：位于气泡底边下方，落在容器抬升出来的预留区里（原版用 -bottom-2.5/-2，
-           但那会伸到窗口底边之外被裁；容器已按 TAIL_OVERHANG 抬升，这里等价落位） -->
-      <div
-        class="absolute -bottom-2.5 left-1/2 h-0 w-0 -translate-x-1/2 border-r-10 border-l-10 border-t-white/10 border-r-transparent border-l-transparent drop-shadow-md"
-      ></div>
-      <div
-        class="absolute -bottom-2 left-1/2 h-0 w-0 -translate-x-1/2 border-t-8 border-r-8 border-l-8 border-t-white/8 border-r-transparent border-l-transparent"
-      ></div>
+      <!-- 长尾：从气泡盒**朝向宠物**的那条边伸出（上置朝下、下置朝上、左右置水平伸出），
+           一半在盒内一半在盒外，外半截落在窗口让出的 TAIL_OVERHANG 预留区里
+           （原版直接写 -bottom-2.5/-2，但那会伸到窗口底边之外被裁） -->
+      <div class="absolute h-0 w-0 drop-shadow-md" :class="tailOuterClass"></div>
+      <div class="absolute h-0 w-0" :class="tailInnerClass"></div>
+    </div>
 
-      <!-- 通知：钉在气泡顶边上方。气泡高度随文本变化，通知因此始终紧贴气泡顶，
-           而不是钉在窗口顶（那样短气泡与通知之间会隔开一大片空白） -->
-      <div
-        v-if="uiStore.notification.isVisible"
-        class="absolute inset-x-0 bottom-full mb-1 flex justify-center"
-        :style="{ maxHeight: 'var(--notify-h)' }"
-      >
-        <PetNotification />
-      </div>
+    <!-- 通知：气泡的**兄弟**节点，不是子节点。
+         通知与气泡的显隐互相独立（无台词时也可能有通知），塞进气泡里就会被气泡的
+         淡出一起藏掉 —— 表现为"通知永远不显示"。它钉在气泡的背宠一侧：竖向模式下在
+         气泡的上/下方，横向模式下在气泡的下/上方（贴在气泡背离窗口边的那一侧）。
+         气泡高度随文本变化，通知因此始终紧贴气泡，而不是钉在窗口边。 -->
+    <div
+      class="absolute inset-x-0 flex justify-center"
+      :class="top ? 'top-full mt-1' : 'bottom-full mb-1'"
+      :style="{ maxHeight: 'var(--notify-h)' }"
+    >
+      <PetNotification />
     </div>
   </div>
 </template>
@@ -62,8 +63,8 @@
  *
  * 只有打字机动画归本组件，因为它绑在 DOM 上。
  */
-import { ref, watch } from "vue";
-import { useUIStore } from "@/stores/modules/ui/ui";
+import { computed, ref, watch } from "vue";
+import type { BubbleAlign, BubbleSide } from "./bubbleMirror";
 import { useTypeWriter } from "@/composables/ui/useTypeWriter";
 import { createCharRevealWriter } from "@/utils/typewriter/charReveal";
 import { charRevealCharHtml } from "@/utils/typewriter/charHtml";
@@ -79,11 +80,95 @@ const props = defineProps<{
   instant?: boolean;
   /** 气泡高度上限（px），父级按带高算好传入；正文超出部分在盒内滚动 */
   maxHeight: number;
+  /** 气泡在宠物的哪一侧：决定贴窗口哪条边、长尾朝向、通知位置与进出场位移方向 */
+  side?: BubbleSide;
+  /** 左右置时气泡贴窗口上边还是下边（父级按宠物在屏幕上的高低镜像过来）；
+   *  上下置时无意义 —— 它们的贴边由 `side` 唯一决定（上置贴底、下置贴顶） */
+  align?: BubbleAlign;
 }>();
 
 const emit = defineEmits<{ advance: []; drained: [] }>();
 
-const uiStore = useUIStore();
+const side = computed<BubbleSide>(() => props.side ?? "above");
+/** 左右置：版式整体转 90° —— 贴窗口左右边、长尾水平指向宠物、内容纵向贴上/下边 */
+const horizontal = computed(() => side.value === "left" || side.value === "right");
+/**
+ * 气泡盒在窗口里贴哪条边：true = 贴上边。
+ *
+ * 上下置由方位唯一决定（上置贴底、下置贴顶）；左右置由父级给（往离屏幕边远的一侧靠，
+ * 这样气泡始终朝屏幕中部、不会被最近的屏幕边裁掉）。
+ */
+const top = computed(() => (horizontal.value ? props.align !== "bottom" : side.value === "below"));
+
+/**
+ * 根节点只管定位：气泡盒贴窗口哪条边（+ 不可见时不吃鼠标事件）。
+ * 显隐动效不在这里 —— 根节点带着通知，动效挂根上会连通知一起淡掉。
+ */
+const frameClass = computed(() => [
+  ...(horizontal.value
+    ? [
+        // 左右置：贴窗口左边（气泡在宠物右侧）或右边（气泡在宠物左侧），长尾余量留在宠物那一侧
+        side.value === "left" ? "right-(--tail) items-end" : "left-(--tail) items-start",
+        top.value ? "top-0" : "bottom-0",
+      ]
+    : [top.value ? "top-(--tail) items-start" : "bottom-(--tail) items-end"]),
+  props.visible ? "" : "pointer-events-none",
+]);
+
+/**
+ * 长尾的朝向与位置：尾尖永远指向宠物（外半截落在窗口让出的 TAIL 预留区里）。
+ *
+ * 横向三角形的朝向由"哪条边的 border 有颜色"决定：border-r 有颜色 = 指向右。
+ * 类名必须写成完整字面量，拼接的字符串 Tailwind 扫不到、生不出样式。
+ */
+const tailOuterClass = computed(() => {
+  if (side.value === "left") {
+    // 气泡在宠物左侧 → 尾尖朝右
+    return "-right-2.5 top-1/2 -translate-y-1/2 border-t-10 border-b-10 border-r-white/10 border-t-transparent border-b-transparent";
+  }
+  if (side.value === "right") {
+    return "-left-2.5 top-1/2 -translate-y-1/2 border-t-10 border-b-10 border-l-white/10 border-t-transparent border-b-transparent";
+  }
+  return top.value
+    ? "-top-2.5 left-1/2 -translate-x-1/2 border-r-10 border-l-10 border-b-white/10 border-r-transparent border-l-transparent"
+    : "-bottom-2.5 left-1/2 -translate-x-1/2 border-r-10 border-l-10 border-t-white/10 border-r-transparent border-l-transparent";
+});
+
+/** 内层长尾（比外层窄 2px，做出描边感），朝向与外层一致 */
+const tailInnerClass = computed(() => {
+  if (side.value === "left") {
+    return "-right-2 top-1/2 -translate-y-1/2 border-t-8 border-b-8 border-r-white/8 border-t-transparent border-b-transparent";
+  }
+  if (side.value === "right") {
+    return "-left-2 top-1/2 -translate-y-1/2 border-t-8 border-b-8 border-l-white/8 border-t-transparent border-b-transparent";
+  }
+  return top.value
+    ? "-top-2 left-1/2 -translate-x-1/2 border-r-8 border-l-8 border-b-white/8 border-r-transparent border-l-transparent"
+    : "-bottom-2 left-1/2 -translate-x-1/2 border-r-8 border-l-8 border-t-white/8 border-r-transparent border-l-transparent";
+});
+
+/**
+ * 是否已经显示过。
+ *
+ * 气泡盒的隐藏态是靠退场动画的 forwards 停在 opacity:0 上的，而 animation 在**挂载
+ * 时就会播**：没台词切进桌宠时，气泡盒会先按"从可见到不可见"完整播一遍退场动画 ——
+ * 表现为气泡闪一下才消失。所以没显示过之前用无动画的静态隐藏态。
+ */
+const hasShown = ref(false);
+watch(
+  () => props.visible,
+  (visible) => {
+    if (visible) hasShown.value = true;
+  },
+  { immediate: true },
+);
+
+/** 气泡盒自己的显隐动效（与下面的通知无关，两者互不牵连）；方向 = 从宠物那一侧进出 */
+const animClass = computed(() => {
+  if (props.visible) return `enter-${side.value}`;
+  if (!hasShown.value) return "bubble-hidden";
+  return `leave-${side.value}`;
+});
 
 const textRef = ref<HTMLElement | null>(null);
 const bubbleRef = ref<HTMLElement | null>(null);
@@ -225,20 +310,30 @@ defineExpose({
  * 出现/消失动效 —— 复刻自 5f61eeec「feat: 添加气泡/通知换位动效」与当时 DialogueBox 的定义：
  *   容器 transition-all duration-300 ease-out，位移 ±2（translate-y-0 ↔ -translate-y-2）配合 opacity 0 ↔ 100。
  *
- * 两处改动：
+ * 三处改动：
  *   1. 用关键帧而非类切换：本组件节点常驻（见模板注释），必须在没有"上一次状态"的
  *      情况下也能播出进场动效，animation 天然满足。
- *   2. 位移方向改为进场自下而上、退场向下（原版两个方向都朝上，进场像缩回宠物头顶）。
+ *   2. 位移方向 = **从宠物那一侧进出**（上置自下而上、下置自上而下、左右置水平推入推出），
+ *      原版两个方向都朝上，进场像缩回宠物头顶。
+ *   3. 动效挂在**气泡盒**而不是根节点上：根节点还带着通知，挂根上会连通知一起淡掉。
+ *
+ * 四种方位各一套（而不是在关键帧里用 var() 取方向），避免依赖自定义属性在 keyframes 中
+ * 的求值细节 —— 那在部分 WebView 上不生效。
  */
-.enter {
-  animation: bubble-in 300ms cubic-bezier(0, 0, 0.2, 1);
+/* 从未显示过的静止隐藏态：不带动画，避免挂载那一刻播一遍退场动画（气泡闪一下） */
+.bubble-hidden {
+  opacity: 0;
 }
 
-.leave {
-  animation: bubble-out 300ms cubic-bezier(0, 0, 0.2, 1) forwards;
+.enter-above {
+  animation: bubble-in-above 300ms cubic-bezier(0, 0, 0.2, 1);
 }
 
-@keyframes bubble-in {
+.leave-above {
+  animation: bubble-out-above 300ms cubic-bezier(0, 0, 0.2, 1) forwards;
+}
+
+@keyframes bubble-in-above {
   from {
     opacity: 0;
     transform: translateY(6px) scale(0.98);
@@ -249,7 +344,7 @@ defineExpose({
   }
 }
 
-@keyframes bubble-out {
+@keyframes bubble-out-above {
   from {
     opacity: 1;
     transform: none;
@@ -257,6 +352,99 @@ defineExpose({
   to {
     opacity: 0;
     transform: translateY(4px) scale(0.98);
+  }
+}
+
+/* 下置：整套镜像 —— 进场自上而下、退场向上（气泡在宠物下方，动效应朝宠物方向收放） */
+.enter-below {
+  animation: bubble-in-below 300ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.leave-below {
+  animation: bubble-out-below 300ms cubic-bezier(0, 0, 0.2, 1) forwards;
+}
+
+@keyframes bubble-in-below {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes bubble-out-below {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+}
+
+/* 右置（气泡在宠物右侧）：自左向右推入、向左收回 —— 位移方向朝着宠物 */
+.enter-right {
+  animation: bubble-in-right 300ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.leave-right {
+  animation: bubble-out-right 300ms cubic-bezier(0, 0, 0.2, 1) forwards;
+}
+
+@keyframes bubble-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(-6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes bubble-out-right {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: translateX(-4px) scale(0.98);
+  }
+}
+
+/* 左置（气泡在宠物左侧）：镜像一套 */
+.enter-left {
+  animation: bubble-in-left 300ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.leave-left {
+  animation: bubble-out-left 300ms cubic-bezier(0, 0, 0.2, 1) forwards;
+}
+
+@keyframes bubble-in-left {
+  from {
+    opacity: 0;
+    transform: translateX(6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes bubble-out-left {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: translateX(4px) scale(0.98);
   }
 }
 

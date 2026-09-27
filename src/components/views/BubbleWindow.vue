@@ -8,6 +8,7 @@
     id="bubble-app"
     :style="appStyleVars"
     class="relative overflow-hidden bg-transparent transition-none select-none"
+    :class="swapClass"
   >
     <DialogueBox
       ref="dialogRef"
@@ -17,18 +18,26 @@
       :speed="uiStore.typeWriterSpeed"
       :instant="instant"
       :max-height="bubbleMaxHeight"
+      :side="side"
+      :align="align"
     />
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useSettingsStore } from "@/stores/modules/settings";
 import { useUIStore } from "@/stores/modules/ui/ui";
 import { useGameStore } from "@/stores/modules/game";
 import DialogueBox from "../pet/DialogueBox.vue";
-import { PET_BUBBLE_EVENT, PET_BUBBLE_REQUEST, type BubbleMirror } from "../pet/bubbleMirror";
+import {
+  PET_BUBBLE_EVENT,
+  PET_BUBBLE_REQUEST,
+  type BubbleAlign,
+  type BubbleMirror,
+  type BubbleSide,
+} from "../pet/bubbleMirror";
 import {
   BAND_BASE,
   DIALOG_MAX_BASE,
@@ -66,10 +75,50 @@ const bubbleVisible = computed(
 );
 
 /**
- * 气泡可用高度 = 整条气泡带。长尾在气泡盒内部、由容器抬升出的预留区承接，
- * 所以盒子取满带高也不会让尾巴越出窗口；超出这个高度的正文改为盒内滚动。
+ * 气泡正文可用高度 = 气泡带减去通知预算。
+ *
+ * 通知钉在气泡的背宠一侧（上置时在气泡上方、下置时在下方），所以气泡带是
+ * 「正文 + 通知」共用的：正文取满整条带，通知就顶到窗口之外被裁掉。DIALOG_MAX_BASE
+ * 正是按这个减法定的（278 - 72 - 16），超出这个高度的正文改为盒内滚动。
  */
-const bubbleMaxHeight = computed(() => Math.round(BAND_BASE * scale.value));
+const bubbleMaxHeight = computed(() => Math.round(DIALOG_MAX_BASE * scale.value));
+
+/**
+ * 气泡在宠物的哪一侧，由宠物窗判定后镜像过来（手动设置 + 自动选边）。
+ * 决定整块内容的贴边方向、长尾朝向、通知位置与进出场动效方向。
+ */
+const side = ref<BubbleSide>("above");
+
+/** 左右置时气泡贴窗口上边还是下边（宠物窗按宠物在屏幕上的高低判定后镜像过来） */
+const align = ref<BubbleAlign>("top");
+
+/**
+ * 换位相位。
+ *
+ * 气泡窗是独立窗口，位置由 Rust 改，**跳位是瞬时的**：直接把内容画到新位置会看到
+ * 气泡"闪"到另一边。所以宠物窗换位前会先把 swapping 置真，本窗口先淡掉内容，
+ * 等窗口跳位、侧别镜像过来之后再淡回来 —— 跳位正好落在看不见的这段时间里。
+ */
+const swapping = ref(false);
+/** 淡入只在 swapping 由真转假的那一次播 */
+const fadingIn = ref(false);
+let fadeTimer: number | undefined;
+
+watch(swapping, (now, before) => {
+  if (now) {
+    fadingIn.value = false;
+    return;
+  }
+  if (!before) return;
+  fadingIn.value = true;
+  if (fadeTimer !== undefined) window.clearTimeout(fadeTimer);
+  fadeTimer = window.setTimeout(() => {
+    fadingIn.value = false;
+    fadeTimer = undefined;
+  }, 220);
+});
+
+const swapClass = computed(() => (swapping.value ? "swap-out" : fadingIn.value ? "swap-in" : ""));
 
 const appStyleVars = computed(() => ({
   "--pet-ui-scale": scale.value.toString(),
@@ -82,6 +131,9 @@ const appStyleVars = computed(() => ({
 /** 镜像投影：写进本窗口的 store，DialogueBox / PetNotification 即可直接渲染 */
 const applyMirror = (m: BubbleMirror) => {
   if (m.petScale > 0) scale.value = m.petScale;
+  if (m.bubbleSide) side.value = m.bubbleSide;
+  if (m.bubbleAlign === "top" || m.bubbleAlign === "bottom") align.value = m.bubbleAlign;
+  swapping.value = Boolean(m.swapping);
   // 首个非空台词整段显示（复现现状）；此后任何一句都是新台词 → 播打字机
   if (!firstLineSeen && m.line.trim()) {
     firstLineSeen = true;
@@ -134,5 +186,32 @@ onUnmounted(() => {
 #bubble-app {
   width: 100vw;
   height: 100dvh;
+}
+
+/* 换位：整块内容淡出 → 窗口跳位 → 淡入。跳位藏在这段看不见的窗口期间 */
+.swap-out {
+  animation: bubble-swap-out 150ms ease-in forwards;
+}
+
+.swap-in {
+  animation: bubble-swap-in 200ms ease-out;
+}
+
+@keyframes bubble-swap-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes bubble-swap-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 </style>

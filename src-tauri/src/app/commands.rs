@@ -169,6 +169,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         api::script_editor::agent::editor_agent_resolve_approval,
         api::pet::update_solid_regions,
         api::pet::set_pet_mode,
+        api::pet::set_bubble_side,
         api::schedule::get_schedules,
         api::schedule::save_schedules,
         api::schedule::reload_proactive_system,

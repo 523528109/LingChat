@@ -58,6 +58,46 @@ impl Default for HitTestState {
     }
 }
 
+/// 气泡相对宠物的方位与（左右置时的）纵向贴边。
+///
+/// **由前端决定**（手动设置、"放不下就换边"的自动判定都在宠物窗里算），
+/// Rust 只负责据此摆窗口 —— 判定要用到显示器工作区与宠物窗位置，而宠物窗本来
+/// 就在跟踪这些信息（输入框显隐、视线衰减都依赖它）。
+///
+/// 左右置时纵向位置按 `align` 与宠物窗**对齐同一条边**（贴上边 = 气泡窗顶边对齐宠物窗
+/// 顶边；贴下边 = 底边对齐底边），气泡因此始终跟着宠物在屏幕上的高低走，
+/// 短气泡也不会飘出屏幕。
+pub struct BubbleSideState(pub Mutex<BubblePlacement>);
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct BubblePlacement {
+    pub side: BubbleSide,
+    pub align: BubbleAlign,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum BubbleSide {
+    #[default]
+    Above,
+    Below,
+    Left,
+    Right,
+}
+
+/// 左右置时气泡贴气泡窗的上边还是下边（由前端按宠物在屏幕上的高低判定）
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum BubbleAlign {
+    #[default]
+    Top,
+    Bottom,
+}
+
+impl Default for BubbleSideState {
+    fn default() -> Self {
+        Self(Mutex::new(BubblePlacement::default()))
+    }
+}
+
 #[tauri::command]
 pub fn update_solid_regions(rects: Vec<Rect>, state: tauri::State<'_, HitTestState>) {
     if let Ok(mut locked) = state.solid_rects.lock() {
@@ -252,15 +292,20 @@ pub fn spawn_hit_test_poll(window: tauri::WebviewWindow) {
 
 /// 两窗共用的宽度基准：视觉上必须一致，否则气泡窗与宠物窗明显错位。
 const WINDOW_W: f64 = 264.0;
-/// 宠物窗高度 = 头像带 210 + 输入带 70
-const PET_WINDOW_H: f64 = 280.0;
+/// 宠物窗高度 = 头像带 210 + 输入带 64（与 constants.ts 的 PET_WINDOW_H_BASE 同步）
+const PET_WINDOW_H: f64 = 274.0;
 /// 气泡窗高度 = 气泡带 278 + 长尾余量 10 + 间隙 8
 const BUBBLE_H: f64 = 296.0;
 const BUBBLE_GAP: f64 = 8.0;
 
-/// 按宠物窗当前位置重算气泡窗位置：气泡窗底边落在宠物窗顶边上方 `BUBBLE_GAP` 处。
+/// 按宠物窗当前位置重算气泡窗位置。
 ///
-/// 用气泡窗**实测**逻辑尺寸而不是常量，这样换缩放倍率时偏移自动跟着变。
+/// 上置：气泡窗底边落在宠物窗顶边上方 `BUBBLE_GAP` 处；
+/// 下置：气泡窗顶边落在宠物窗底边下方 `BUBBLE_GAP` 处；
+/// 左/右置：气泡窗贴宠物窗左侧/右侧（长尾水平指向宠物），纵向按 `align` 与宠物窗
+/// 对齐同一条边 —— 贴上边则两窗顶边齐平，贴下边则两窗底边齐平。
+///
+/// 用气泡窗/宠物窗**实测**逻辑尺寸而不是常量，这样换缩放倍率时偏移自动跟着变。
 /// 两窗共用同一 scale_factor，逻辑坐标可直接相加。
 #[cfg(desktop)]
 fn place_bubble(app: &AppHandle, pet: &tauri::WebviewWindow) {
@@ -270,14 +315,73 @@ fn place_bubble(app: &AppHandle, pet: &tauri::WebviewWindow) {
     let (Ok(pos), Ok(scale)) = (pet.outer_position(), pet.scale_factor()) else {
         return;
     };
-    let bubble_h = bubble
-        .outer_size()
-        .map(|size| f64::from(size.height) / scale)
-        .unwrap_or(BUBBLE_H);
-    let _ = bubble.set_position(tauri::LogicalPosition::new(
-        f64::from(pos.x) / scale,
-        f64::from(pos.y) / scale - bubble_h - BUBBLE_GAP,
-    ));
+    let bubble_size = bubble.outer_size().unwrap_or_default();
+    let bubble_h = f64::from(bubble_size.height) / scale;
+    let bubble_w = if bubble_size.width > 0 {
+        f64::from(bubble_size.width) / scale
+    } else {
+        WINDOW_W
+    };
+    let pet_size = pet.outer_size().unwrap_or_default();
+    let pet_h = f64::from(pet_size.height) / scale;
+    let pet_w = if pet_size.width > 0 {
+        f64::from(pet_size.width) / scale
+    } else {
+        WINDOW_W
+    };
+    let placement = app
+        .state::<BubbleSideState>()
+        .0
+        .lock()
+        .map(|placement| *placement)
+        .unwrap_or_default();
+    let pet_left = f64::from(pos.x) / scale;
+    let pet_top = f64::from(pos.y) / scale;
+    // 左右置时的纵向基准：与宠物窗对齐同一条边
+    let side_y = match placement.align {
+        BubbleAlign::Top => pet_top,
+        BubbleAlign::Bottom => pet_top + pet_h - bubble_h,
+    };
+    let (x, y) = match placement.side {
+        BubbleSide::Above => (pet_left, pet_top - bubble_h - BUBBLE_GAP),
+        BubbleSide::Below => (pet_left, pet_top + pet_h + BUBBLE_GAP),
+        BubbleSide::Left => (pet_left - bubble_w - BUBBLE_GAP, side_y),
+        BubbleSide::Right => (pet_left + pet_w + BUBBLE_GAP, side_y),
+    };
+    let _ = bubble.set_position(tauri::LogicalPosition::new(x, y));
+}
+
+/// 设置气泡相对宠物的方位（`align` 只在左右置时起作用），并立即重排一次。
+///
+/// `side` 取值 `"above"`（默认）/`"below"`/`"left"`/`"right"`，其余一律按上方处理；
+/// `align` 取值 `"top"`（默认）/`"bottom"`。
+#[tauri::command]
+#[cfg_attr(not(desktop), allow(unused_variables))]
+pub fn set_bubble_side(
+    side: String,
+    align: Option<String>,
+    app: AppHandle,
+    state: tauri::State<'_, BubbleSideState>,
+) {
+    if let Ok(mut locked) = state.0.lock() {
+        locked.side = match side.as_str() {
+            "below" => BubbleSide::Below,
+            "left" => BubbleSide::Left,
+            "right" => BubbleSide::Right,
+            _ => BubbleSide::Above,
+        };
+        if let Some(align) = align {
+            locked.align = if align == "bottom" {
+                BubbleAlign::Bottom
+            } else {
+                BubbleAlign::Top
+            };
+        }
+    }
+    #[cfg(desktop)]
+    if let Some(pet) = app.get_webview_window("main") {
+        place_bubble(&app, &pet);
+    }
 }
 
 #[cfg(desktop)]
