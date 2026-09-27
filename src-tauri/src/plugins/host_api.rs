@@ -4,6 +4,8 @@
 //! - **HTTP**：`http_get` / `http_post`，复用 `factory::build_http_client`
 //!   （webpki-roots，Android 兼容），返回 `{ status, ok, body }`。
 //! - **宿主控制**：`switch_character`，完整切换当前角色。
+//! - **读素材**：`read_data_file`，把 `data/` 下的文件（角色立绘、TTS 语音等）
+//!   读成 base64 交给插件；只允许 `data/` 内的相对路径。
 //!
 //! 这是**插件专属**面——LLM 拿不到，与 `ctx["call_tool"]` 那条共用通道相对。
 //! 新增宿主能力时，`#[pyfunction]` 直接加在下面的 `plugin_host` 模块里，
@@ -205,6 +207,85 @@ async fn switch_character_impl(app: AppHandle, role_id: i32) -> serde_json::Valu
     }
 }
 
+/// 单次读取上限。插件读素材基本是为了转 base64 发给对端，给宽一点；
+/// 再大就该换别的通道了（也免得一个插件把内存吃满）。
+const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
+
+/// 把插件给的相对路径解析成 `base` 下的真实路径。
+///
+/// 规则（这是沙箱的一部分，别放宽）：
+/// - 只接受相对路径：绝对路径、盘符、`..` 一律拒绝；
+/// - 解析后必须仍在 `base` 内：软链接指到外面也会被这一步拦下。
+///
+/// 显式传 base 是为了能测：全局 `data_dir()` 只在 App 启动时初始化，
+/// 单测里拿不到。
+fn resolve_data_path_in(base: &std::path::Path, rel: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+
+    let rel = rel.trim();
+    if rel.is_empty() {
+        return Err("路径为空".to_string());
+    }
+    let candidate = std::path::Path::new(rel);
+    if candidate.is_absolute() {
+        return Err("只接受相对 data/ 的路径".to_string());
+    }
+    for comp in candidate.components() {
+        match comp {
+            Component::Normal(_) | Component::CurDir => {},
+            _ => return Err("路径里不能有 .. 或盘符".to_string()),
+        }
+    }
+
+    let real = base
+        .join(candidate)
+        .canonicalize()
+        .map_err(|e| format!("读取失败: {e}"))?;
+    let base_real = base
+        .canonicalize()
+        .map_err(|e| format!("data 目录不可用: {e}"))?;
+    if !real.starts_with(&base_real) {
+        return Err("越界：只能读 data/ 下的文件".to_string());
+    }
+    Ok(real)
+}
+
+/// 读 `data/` 下的文件并转 base64；失败返回 `{ok: false, error}`，不抛异常。
+fn read_data_file_impl(rel: &str) -> serde_json::Value {
+    read_data_file_impl_in(&crate::api::data_dir(), rel)
+}
+
+/// `read_data_file_impl` 的显式 base 版本（测试用临时目录）。
+fn read_data_file_impl_in(base: &std::path::Path, rel: &str) -> serde_json::Value {
+    use base64::Engine as _;
+
+    let path = match resolve_data_path_in(base, rel) {
+        Ok(path) => path,
+        Err(e) => return serde_json::json!({ "ok": false, "error": e }),
+    };
+    let meta = match std::fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) => return serde_json::json!({ "ok": false, "error": format!("读取失败: {e}") }),
+    };
+    if !meta.is_file() {
+        return serde_json::json!({ "ok": false, "error": "不是普通文件" });
+    }
+    if meta.len() > MAX_READ_BYTES {
+        return serde_json::json!({
+            "ok": false,
+            "error": format!("文件太大（{} 字节，上限 {MAX_READ_BYTES}）", meta.len()),
+        });
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::json!({
+            "ok": true,
+            "size": bytes.len(),
+            "base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        }),
+        Err(e) => serde_json::json!({ "ok": false, "error": format!("读取失败: {e}") }),
+    }
+}
+
 /// 插件宿主原生模块。插件脚本里用 `from plugin_host import ...` 取用。
 #[pymodule]
 mod plugin_host {
@@ -252,6 +333,23 @@ mod plugin_host {
         super::send_and_to_py(req, vm)
     }
 
+    /// 读取 `data/` 下的文件，返回 base64。
+    ///
+    /// 用法：`read_data_file("game_data/characters/风雪/avatar/高兴.webp")`
+    ///
+    /// 返回：成功 `{ "ok": true, "size": 12345, "base64": "..." }`；
+    /// 失败 `{ "ok": false, "error": "..." }`（不抛异常，插件好处理）。
+    ///
+    /// 只接受相对 `data/` 的路径，`..`、绝对路径、指向外部的软链接都会被拒——
+    /// 插件仍然拿不到游戏目录之外的东西。单次读取上限 16MB。
+    #[pyfunction]
+    fn read_data_file(path: String, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+        Ok(super::value_to_pyobject(
+            vm,
+            &super::read_data_file_impl(&path),
+        ))
+    }
+
     /// 完整切换当前角色：清空对话上下文、重置角色内存、刷新前端。
     ///
     /// 用法：`switch_character(role_id)`
@@ -279,4 +377,61 @@ pub(crate) fn plugin_module_def(
     ctx: &rustpython_vm::Context,
 ) -> &'static rustpython_vm::builtins::PyModuleDef {
     plugin_host::module_def(ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一个临时 data 目录：`game_data/characters/风雪/高兴.webp`，
+    /// 并在它**外面**放一个「机密」文件，用来验证越界读取会被拒。
+    fn temp_data_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+        let outer = tempfile::tempdir().expect("建临时目录失败");
+        let base = outer.path().join("data");
+        let avatar_dir = base.join("game_data").join("characters").join("风雪");
+        std::fs::create_dir_all(&avatar_dir).expect("建目录失败");
+        std::fs::write(avatar_dir.join("高兴.webp"), b"fake-webp").expect("写立绘失败");
+        std::fs::write(outer.path().join("lingchat_secret.txt"), b"secret").expect("写外部文件失败");
+        (outer, base)
+    }
+
+    #[test]
+    fn reads_file_under_base_dir() {
+        let (_outer, base) = temp_data_dir();
+        let got = read_data_file_impl_in(&base, "game_data/characters/风雪/高兴.webp");
+        assert_eq!(got["ok"], serde_json::json!(true), "{got}");
+        assert_eq!(got["size"], serde_json::json!(9), "{got}");
+        assert_eq!(got["base64"], serde_json::json!("ZmFrZS13ZWJw"), "{got}");
+    }
+
+    #[test]
+    fn rejects_paths_outside_base_dir() {
+        let (_outer, base) = temp_data_dir();
+        for bad in [
+            "../lingchat_secret.txt",
+            "game_data/../../lingchat_secret.txt",
+            "/etc/passwd",
+            "C:\\Windows\\win.ini",
+            "",
+        ] {
+            assert!(
+                resolve_data_path_in(&base, bad).is_err(),
+                "应当拒绝越界路径：{bad:?}"
+            );
+            let got = read_data_file_impl_in(&base, bad);
+            assert_eq!(got["ok"], serde_json::json!(false), "{bad:?} → {got}");
+        }
+    }
+
+    #[test]
+    fn rejects_directory_and_missing_file() {
+        let (_outer, base) = temp_data_dir();
+        // 目录不是文件
+        let got = read_data_file_impl_in(&base, "game_data/characters");
+        assert_eq!(got["ok"], serde_json::json!(false), "{got}");
+        // 不存在的文件：报错但不 panic
+        let got = read_data_file_impl_in(&base, "game_data/nope.webp");
+        assert_eq!(got["ok"], serde_json::json!(false), "{got}");
+        assert!(got["error"].as_str().unwrap_or_default().contains("读取失败"));
+    }
 }

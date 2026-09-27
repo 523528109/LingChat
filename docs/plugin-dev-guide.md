@@ -171,6 +171,25 @@ r = http_post("https://example.com/api", headers={"Authorization": "Bearer xx"},
 
 注意 `body` 里的 JSON 在 `r["body"]` 字段下，不是顶层（打个比方，Tavily 结果要取 `r["body"]["results"]`）。
 
+## 读游戏素材：`from plugin_host import read_data_file`
+
+插件的沙箱不允许直接读文件系统，但有些插件确实需要游戏自己的素材——比如把角色立绘
+裁成表情包发给外部服务、或者把 TTS 语音转发出去。`read_data_file` 就是给这个用的：
+
+```python
+from plugin_host import read_data_file
+
+r = read_data_file("game_data/characters/风雪/avatar/高兴.webp")
+
+# 成功：{ "ok": true, "size": 12345, "base64": "..." }
+# 失败：{ "ok": false, "error": "..." }
+```
+
+- 只接受**相对 `data/`** 的路径：`..`、绝对路径、以及指向 `data/` 外面的软链接都会被拒绝
+- 单个文件上限 16MB，超了返回 `ok: false`
+- 失败不抛异常，按返回值处理即可
+- 目录名和角色显示名不一定一样（立绘目录由角色数据决定），插件侧别按显示名硬拼
+
 ## 订阅宿主信号：`[[subscribe]]`
 
 工具是「LLM 来调你」，信号是「宿主来调你」。在 manifest 顶层声明要监听哪些信号：
