@@ -544,6 +544,28 @@ pub struct CharacterSettings {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+/// 只存在于运行时的字段，写盘前一律剥掉。
+///
+/// `CharacterSettings` 用 `#[serde(flatten)] extra` 兜底未知键，不剥会把这些瞬态值
+/// 原样落到 YAML 里。字段由 `db::managers::role_repo` 在读取时回填，YAML 中即使写了
+/// 也会被覆盖，所以剥掉是纯净化。
+pub const TRANSIENT_SETTINGS_FIELDS: [&str; 5] = [
+    "character_id",
+    "resource_path",
+    "character_folder",
+    "script_key",
+    "script_role_key",
+];
+
+/// 从已序列化的角色设定里剥掉瞬态字段。非对象则原样返回。
+pub fn strip_transient_fields(value: &mut Value) {
+    if let Some(obj) = value.as_object_mut() {
+        for field in TRANSIENT_SETTINGS_FIELDS {
+            obj.remove(field);
+        }
+    }
+}
+
 fn default_ai_name() -> String {
     "ai_name未设定".into()
 }

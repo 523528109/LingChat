@@ -11,14 +11,13 @@ use tokio_util::sync::CancellationToken;
 use crate::AppState;
 use crate::ai_service::types::{
     CharacterSettings, Live2dEyeBlinkBinding, Live2dMotionBinding, Live2dParameterBinding,
-    Live2dSettings, Live2dVariant,
+    Live2dSettings, Live2dVariant, strip_transient_fields,
 };
-use crate::db::entities::role::RoleType;
 use crate::db::managers::role_repo::RoleRepo;
 use crate::utils::archive::extract_zip;
-use crate::utils::yaml_file::write_json_as_yaml;
+use crate::utils::yaml_file::{resolve_settings_file, write_json_as_yaml};
 
-use super::game_data_dir;
+use super::resolve_role_dir;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -53,26 +52,6 @@ pub struct Live2dVariantAssets {
     pub expressions: HashMap<String, String>,
     /// 动作组名 -> 文件列表（模型目录相对路径）
     pub motions: HashMap<String, Vec<String>>,
-}
-
-fn role_dir(
-    role_type: &RoleType,
-    folder: &str,
-    script_key: Option<&str>,
-) -> Result<PathBuf, String> {
-    match role_type {
-        RoleType::Main => Ok(super::resolve_character_dir(folder)),
-        RoleType::Npc => script_key
-            .map(|key| {
-                game_data_dir()
-                    .join("scripts")
-                    .join(key)
-                    .join("characters")
-                    .join(folder)
-            })
-            .ok_or_else(|| "剧本角色缺少 script_key".to_string()),
-        RoleType::System | RoleType::User => Err("系统角色不支持 Live2D 资源".to_string()),
-    }
 }
 
 fn copy_directory(source: &Path, target: &Path) -> Result<(), String> {
@@ -640,7 +619,7 @@ pub async fn import_live2d(
         .resource_folder
         .as_deref()
         .ok_or_else(|| "角色资源目录不存在".to_string())?;
-    let root = role_dir(&role.role_type, folder, role.script_key.as_deref())?;
+    let root = resolve_role_dir(&role.role_type, role.script_key.as_deref(), folder)?;
     let source = PathBuf::from(source_path);
     if !source.exists() {
         return Err("Live2D 来源不存在".to_string());
@@ -840,18 +819,8 @@ pub async fn import_live2d(
             return Err(error.to_string());
         },
     };
-    if let Some(object) = value.as_object_mut() {
-        for transient in [
-            "character_id",
-            "resource_path",
-            "character_folder",
-            "script_key",
-            "script_role_key",
-        ] {
-            object.remove(transient);
-        }
-    }
-    if let Err(error) = write_json_as_yaml(&root.join("settings.yml"), &value) {
+    strip_transient_fields(&mut value);
+    if let Err(error) = write_json_as_yaml(&resolve_settings_file(&root), &value) {
         let _ = fs::remove_dir_all(&target);
         return Err(format!("保存 Live2D 配置失败: {error}"));
     }
@@ -882,7 +851,7 @@ pub async fn get_live2d_file(
         .resource_folder
         .as_deref()
         .ok_or_else(|| "角色资源目录不存在".to_string())?;
-    let root = role_dir(&role.role_type, folder, role.script_key.as_deref())?;
+    let root = resolve_role_dir(&role.role_type, role.script_key.as_deref(), folder)?;
     let resolved = root.join(file_path);
     crate::utils::path::validate_path_in_base(&resolved, &root)?;
     if !resolved.is_file() {
@@ -905,7 +874,7 @@ pub async fn inspect_live2d(app: AppHandle, role_id: i32) -> Result<Live2dImport
         .resource_folder
         .as_deref()
         .ok_or_else(|| "角色资源目录不存在".to_string())?;
-    let root = role_dir(&role.role_type, folder, role.script_key.as_deref())?;
+    let root = resolve_role_dir(&role.role_type, role.script_key.as_deref(), folder)?;
     let settings = RoleRepo::get_role_settings_by_id(&state.db, &super::data_dir(), role_id)
         .await
         .map_err(|e| format!("读取角色配置失败: {e}"))?
@@ -942,7 +911,7 @@ pub async fn get_live2d_variant_assets(
         .resource_folder
         .as_deref()
         .ok_or_else(|| "角色资源目录不存在".to_string())?;
-    let root = role_dir(&role.role_type, folder, role.script_key.as_deref())?;
+    let root = resolve_role_dir(&role.role_type, role.script_key.as_deref(), folder)?;
     let settings = RoleRepo::get_role_settings_by_id(&state.db, &super::data_dir(), role_id)
         .await
         .map_err(|e| format!("读取角色配置失败: {e}"))?
