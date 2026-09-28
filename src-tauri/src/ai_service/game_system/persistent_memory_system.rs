@@ -1043,7 +1043,7 @@ mod tests {
     fn updating_guard_always_releases_the_flag() {
         let flag = Arc::new(AtomicBool::new(true));
         {
-            let _guard = UpdatingGuard(flag.clone());
+            let _guard = UpdatingGuard(flag.clone(), Arc::new(Notify::new()));
         }
         assert!(!flag.load(Ordering::Acquire));
     }
