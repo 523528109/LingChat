@@ -49,6 +49,10 @@ description = "基于 Tavily 的联网搜索与网页提取"
 version = "0.1.0"
 author = "LingChat"
 
+# 可选：允许 read_data_file 读取的 data/ 下相对路径（目录前缀，含其子树）。
+# 未声明的路径一律拒绝；不写 = 不能读任何文件。
+read = ["game_data/characters", "voice"]
+
 # 可选：设置页渲染配置表单。kind 支持 string / secret / number / boolean
 [[config]]
 key = "max_results"
@@ -71,7 +75,7 @@ script = "tavily.py"
 parameters = '{ "type":"object", "properties":{ "query":{"type":"string"}, "max_results":{"type":"integer","default":5} }, "required":["query"] }'
 ```
 
-除工具与资源，插件还可以订阅宿主信号（`[[subscribe]]`）、声明启动入口（`[startup]`）与前置插件（`depends_on`），见后文对应章节。
+除工具与资源，插件还可以订阅宿主信号（`[[subscribe]]`）、声明启动入口（`[startup]`）、前置插件（`depends_on`）与可读素材范围（`read`），见后文对应章节。
 
 ## 插件携带资源（人物 / 剧本 / 音乐 / 背景图 / 环境音）
 
@@ -176,6 +180,11 @@ r = http_post("https://example.com/api", headers={"Authorization": "Bearer xx"},
 插件的沙箱不允许直接读文件系统，但有些插件确实需要游戏自己的素材——比如把角色立绘
 裁成表情包发给外部服务、或者把 TTS 语音转发出去。`read_data_file` 就是给这个用的：
 
+```toml
+# manifest.toml：先声明能读哪些目录（相对 data/ 的目录前缀，含其子树）
+read = ["game_data/characters", "voice"]
+```
+
 ```python
 from plugin_host import read_data_file
 
@@ -185,9 +194,12 @@ r = read_data_file("game_data/characters/风雪/avatar/高兴.webp")
 # 失败：{ "ok": false, "error": "..." }
 ```
 
-- 只接受**相对 `data/`** 的路径：`..`、绝对路径、以及指向 `data/` 外面的软链接都会被拒绝
-- 单个文件上限 16MB，超了返回 `ok: false`
-- 失败不抛异常，按返回值处理即可
+- **必须先声明**：路径要落在 manifest `read` 声明的某个前缀之下，没声明的目录读不到
+  （返回 `ok: false`，`error` 里会提示「未声明」）；不写 `read` = 一个文件都读不了
+- `read` 里只能写**相对 `data/`** 的路径，`..`、绝对路径、盘符会让 manifest 直接校验失败
+- 请求路径同样只接受相对 `data/` 的路径：`..`、绝对路径、以及指向声明目录外的软链接都会被拒绝
+- 单个文件上限 64MB，超了返回 `ok: false`
+- 失败不抛异常，按返回值处理即可；`error` 里只有你自己给的相对路径，不会带宿主绝对路径
 - 目录名和角色显示名不一定一样（立绘目录由角色数据决定），插件侧别按显示名硬拼
 
 ## 订阅宿主信号：`[[subscribe]]`
@@ -643,7 +655,7 @@ def run(ctx):
 
 - 禁用的顶层模块：`os`、`subprocess`、`shutil`、`pathlib`、`ctypes`、`sysconfig`
 - 环境变量只有 manifest `[[env]]` 白名单内的会注入 `ctx["env"]`
-- 脚本无法直接读写文件系统、启动子进程、加载系统库。
+- 脚本无法直接写文件系统、启动子进程、加载系统库；读也只有一个口子——`read_data_file`，且只能读 manifest `read` 声明过的 `data/` 子目录（未声明 = 一律拒绝，见「读游戏素材」一节）。
 - 每次调用新建解释器，无跨调用状态；超时（`timeout_ms`，上限 120000ms）后执行结果作废、本次调用终止。
 - **注意**：超时无法强制中断脚本所在的阻塞线程，死循环可能残留占用线程直至进程退出，插件作者（和你们的agent）应避免写死循环。
 - `call_tool` 是有意的受信任通道，可触达所有注册工具（含写操作）。（谨慎使用）

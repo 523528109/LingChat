@@ -19,7 +19,9 @@ use super::python_backend;
 use super::resources::{self, PluginResourceEntry};
 use super::signal::SignalRegistry;
 use super::tool::PluginTool;
-use super::types::{ConfigKind, PluginInfo, PluginRecord, PluginState, ResourceKind, StartupDecl};
+use super::types::{
+    ConfigKind, PluginInfo, PluginRecord, PluginRunEnv, PluginState, ResourceKind, StartupDecl,
+};
 
 /// 集中插件状态文件名（data/plugins/state.json，仿 tool_permissions.toml）。
 const STATE_FILE_NAME: &str = "state.json";
@@ -222,20 +224,19 @@ impl PluginManager {
         records.get(id).map(|r| r.dir.clone())
     }
 
-    /// 获取插件运行所需的 config 与白名单环境变量。
+    /// 获取插件运行所需的 config、白名单环境变量与可读路径声明。
     ///
     /// 在 `spawn_blocking` 线程内调用，`blocking_lock` 等待锁安全。
-    pub fn plugin_run_env(
-        &self,
-        id: &str,
-    ) -> (HashMap<String, serde_json::Value>, HashMap<String, String>) {
+    pub fn plugin_run_env(&self, id: &str) -> PluginRunEnv {
         let records = self.records.blocking_lock();
         let Some(record) = records.get(id) else {
-            return (HashMap::new(), HashMap::new());
+            return PluginRunEnv::default();
         };
-        let config = record.state.config.clone();
-        let env = python_backend::collect_env(&record.manifest);
-        (config, env)
+        PluginRunEnv {
+            config: record.state.config.clone(),
+            env: python_backend::collect_env(&record.manifest),
+            read: record.manifest.read.clone(),
+        }
     }
 
     /// 列表（供前端）。
@@ -682,14 +683,13 @@ impl PluginManager {
                     tokio::task::spawn_blocking(move || {
                         let _permit = permit;
                         let manager = app.state::<AppState>().data().plugin_manager.clone();
-                        let (config, env) = manager.plugin_run_env(&plugin_id);
+                        let run_env = manager.plugin_run_env(&plugin_id);
                         python_backend::run_plugin_handler(
                             &script_path,
                             &handler,
                             &signal_name,
                             &payload,
-                            &config,
-                            &env,
+                            run_env,
                             app,
                         )
                     }),
@@ -926,14 +926,8 @@ impl PluginManager {
                     return Err("插件已被停用".to_string());
                 }
                 let manager = app_handle.state::<AppState>().data().plugin_manager.clone();
-                let (config, env) = manager.plugin_run_env(&plugin_id);
-                python_backend::run_plugin_startup(
-                    &script_path,
-                    &handler,
-                    &config,
-                    &env,
-                    app_handle,
-                )
+                let run_env = manager.plugin_run_env(&plugin_id);
+                python_backend::run_plugin_startup(&script_path, &handler, run_env, app_handle)
             }),
         )
         .await;

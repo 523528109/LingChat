@@ -95,6 +95,12 @@ pub fn validate(manifest: &PluginManifest) -> Result<()> {
             manifest.id
         );
     }
+    for path in &manifest.read {
+        // 与插件运行期传入的请求路径共用同一份校验（host_api）。
+        crate::plugins::host_api::check_relative_data_path(path.trim()).map_err(|e| {
+            anyhow::anyhow!("插件 '{}' 的 read 声明 '{path}' 非法：{e}", manifest.id)
+        })?;
+    }
     for dep in &manifest.depends_on {
         if !is_valid_plugin_id(dep) {
             anyhow::bail!("插件 '{}' 的前置插件名 '{dep}' 非法", manifest.id);
@@ -297,5 +303,52 @@ parameters = '{{ "type": "object" }}'
 "#
         );
         assert!(parse(&text).is_err(), "未知字段应拒绝，而不是静默忽略");
+    }
+
+    #[test]
+    fn accepts_read_declarations() {
+        let text = format!(
+            r#"{HEAD}
+read = ["game_data/characters", "voice"]
+
+[[subscribe]]
+signal = "app:start"
+script = "boot.py"
+handler = "on_start"
+"#
+        );
+        let manifest = parse(&text).expect("合法的 read 声明应通过");
+        assert_eq!(manifest.read, vec!["game_data/characters", "voice"]);
+    }
+
+    #[test]
+    fn read_declaration_is_optional() {
+        let text = format!(
+            r#"{HEAD}
+[[subscribe]]
+signal = "app:start"
+script = "boot.py"
+handler = "on_start"
+"#
+        );
+        // 没写 read 的旧 manifest 照旧能加载（= 不能读任何文件）
+        assert!(parse(&text).expect("应能解析").read.is_empty());
+    }
+
+    #[test]
+    fn rejects_read_declaration_escaping_data_dir() {
+        for bad in ["/etc/passwd", "../secret.txt", "game_data/../../secret", ""] {
+            let text = format!(
+                r#"{HEAD}
+read = ["{bad}"]
+
+[[subscribe]]
+signal = "app:start"
+script = "boot.py"
+handler = "on_start"
+"#
+            );
+            assert!(parse(&text).is_err(), "应拒绝非法 read 声明：{bad:?}");
+        }
     }
 }
