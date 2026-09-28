@@ -13,19 +13,46 @@ export interface AsrResult {
 
 export interface ProviderConfig {
   api_key: string;
+  /** 非实时（同步）端点 */
   endpoint: string;
+  /** 实时（流式）WebSocket 端点；与 endpoint 独立（协议不同，用户可能只覆盖其一） */
+  ws_endpoint?: string;
   model: string;
+  /** DashScope 地域 id（"cn-beijing" / "ap-southeast-1"）；空/未知 = 默认地域 */
+  region?: string;
+  /** 预编译热词表 ID（fun-asr-realtime / paraformer-realtime 系） */
+  vocabulary_id?: string;
+  /** 热词，逗号/分号/空白分隔，可带权重（"词:4"） */
+  hotwords?: string;
   extra?: Record<string, string>;
 }
+
+/** 模型对应的端点类型：选中该模型时把对应端点字段填成当前地域的默认值 */
+export type EndpointKind = "http" | "ws";
 
 export interface ModelInfo {
   id: string;
   display_name: string;
   supports_streaming: boolean;
   is_default: boolean;
-  /** 协议端点预设（选中该模型时同步填入 endpoint；None 用当前配置） */
-  endpoint?: string | null;
+  /**
+   * 端点预设类型。只给类型不给完整 URL —— 端点是地域相关的，
+   * 实际地址从 activeProviderInfo.regions 按当前地域取（避免两处真相）。
+   * null = 不干预端点（本地 llama-asr 的地址与模型无关）。
+   */
+  endpoint_kind?: EndpointKind | null;
 }
+
+/** 与后端 region.rs 的 AsrRegionInfo 对齐：某地域的端点默认值 */
+export interface AsrRegionInfo {
+  id: string;
+  label: string;
+  http_endpoint: string;
+  ws_endpoint: string;
+}
+
+/** 一次识别调用的热词：纯词（默认权重）或带权重对象 */
+export type HotwordInput = string | { text: string; weight?: number };
 
 export interface AsrSettings {
   active_provider: string;
@@ -47,7 +74,13 @@ export interface AsrSettings {
 }
 
 /** 与后端 `provider.rs` 的 `ConfigFieldKind`（snake_case 字符串）严格对齐 */
-export type ConfigFieldKind = "text" | "password" | "number" | "boolean";
+export type ConfigFieldKind = "text" | "password" | "number" | "boolean" | "select";
+
+/** select 字段的一个选项 */
+export interface AsrConfigFieldOption {
+  value: string;
+  label: string;
+}
 
 export interface AsrConfigField {
   key: string;
@@ -57,6 +90,8 @@ export interface AsrConfigField {
   default_value?: string;
   placeholder?: string;
   hint?: string;
+  /** 仅 kind === "select" 时有值 */
+  options?: AsrConfigFieldOption[];
 }
 
 export interface ProviderInfo {
@@ -66,6 +101,11 @@ export interface ProviderInfo {
   description?: string;
   config_fields: AsrConfigField[];
   supports_streaming: boolean;
+  /**
+   * 可选地域列表（含各地域端点默认值）。空/缺省 = 该 provider 无地域概念
+   * （如本地 llama-asr），不渲染地域下拉、切地域联动也不生效。
+   */
+  regions?: AsrRegionInfo[];
 }
 
 export interface VadEvent {
@@ -81,23 +121,32 @@ export const asrStopListening = (source: AsrSource) =>
 
 export const asrVadProcessChunk = (pcm: number[]) => invoke<void>("asr_vad_process_chunk", { pcm });
 
+/** `hotwords` 省略时走后端 provider 配置级热词的兜底；
+ *  未来接入角色级热词时在这里传入即可，provider 侧无需改动。 */
 export const asrRecognizeWav = (params: {
   providerId: string;
   wavBytes: number[];
   languageHint?: string | null;
+  hotwords?: HotwordInput[] | null;
 }) =>
   invoke<AsrResult>("asr_recognize_wav", {
     providerId: params.providerId,
     wavBytes: params.wavBytes,
     languageHint: params.languageHint ?? null,
+    hotwords: params.hotwords ?? null,
   });
 
 /** 结果流式识别（llama-asr SSE）：整段 WAV 上传 → partial 事件 → final。
  *  与 WS 会话流式（asr_start_streaming 系列）独立。 */
-export const asrRecognizeWavStream = (params: { providerId: string; wavBytes: number[] }) =>
+export const asrRecognizeWavStream = (params: {
+  providerId: string;
+  wavBytes: number[];
+  hotwords?: HotwordInput[] | null;
+}) =>
   invoke<AsrResult>("asr_recognize_wav_stream", {
     providerId: params.providerId,
     wavBytes: params.wavBytes,
+    hotwords: params.hotwords ?? null,
   });
 
 export const asrCancel = () => invoke<void>("asr_cancel");
@@ -130,10 +179,15 @@ export const asrSetSettings = (settings: AsrSettings) =>
 export const asrTestProvider = (providerId: string) =>
   invoke<void>("asr_test_provider", { providerId });
 
-export const asrStartStreaming = (params: { providerId: string; languageHint?: string | null }) =>
+export const asrStartStreaming = (params: {
+  providerId: string;
+  languageHint?: string | null;
+  hotwords?: HotwordInput[] | null;
+}) =>
   invoke<void>("asr_start_streaming", {
     providerId: params.providerId,
     languageHint: params.languageHint ?? null,
+    hotwords: params.hotwords ?? null,
   });
 
 export const asrStreamAudioChunk = (pcm: number[]) =>

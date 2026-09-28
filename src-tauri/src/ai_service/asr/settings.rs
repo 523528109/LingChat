@@ -11,7 +11,8 @@ use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
 use super::error::AsrError;
-use super::provider::ProviderCredentials;
+use super::provider::{Hotword, ProviderCredentials, QwenAsrProvider};
+use super::region::DashScopeRegion;
 
 /// 识别后文本如何处理。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
@@ -24,15 +25,35 @@ pub enum SendMode {
     AutoSend,
 }
 
-/// 单个 provider 的配置：API key + endpoint + 模型 + 任意额外字段。
+/// 单个 provider 的配置：API key + 端点 + 模型 + 地域 + 热词 + 任意额外字段。
+///
+/// **新增字段必须同步加到这里**：设置页把 `config_fields[].key` 写成顶层键
+/// （`providerCfgRecord[field.key]`），而本结构没有 `deny_unknown_fields`
+/// —— 只加 `AsrConfigField` 而不加字段，用户填的值会被 serde 静默丢弃。
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ProviderConfig {
     #[serde(default)]
     pub api_key: String,
+    /// 非实时（同步）端点。
     #[serde(default)]
     pub endpoint: String,
+    /// 实时（流式）WebSocket 端点。与 `endpoint` 分开：协议不同，且用户可能
+    /// 只覆盖其一（业务空间专属域名的 HTTP 与 WS 未必同源）。
+    #[serde(default)]
+    pub ws_endpoint: String,
     #[serde(default)]
     pub model: String,
+    /// DashScope 地域 id（见 [`DashScopeRegion`]）；空/未知 = 默认地域。
+    #[serde(default)]
+    pub region: String,
+    /// 预编译热词列表 ID（`fun-asr-realtime` / `paraformer-realtime` 系）。
+    #[serde(default)]
+    pub vocabulary_id: String,
+    /// 热词，逗号/分号/空白分隔；每项可带权重（`词:4`）。
+    /// 当前是 provider 级**兜底**——按调用传入的热词（`AsrOptions::hotwords`，
+    /// 未来接角色级热词）非空时会覆盖它。
+    #[serde(default)]
+    pub hotwords: String,
     #[serde(default)]
     pub extra: HashMap<String, String>,
 }
@@ -40,26 +61,88 @@ pub struct ProviderConfig {
 impl ProviderConfig {
     /// 转换为 provider 内部使用的凭据结构。
     pub fn to_credentials(&self) -> ProviderCredentials {
+        // 顶层 hotwords 优先；回退 extra["hotwords"]（兼容手工改过
+        // settings.json 的历史配置，那段解析逻辑一直存在但没有 UI 会写入）
+        let hotwords_text = if self.hotwords.trim().is_empty() {
+            self.extra.get("hotwords").map(String::as_str).unwrap_or("")
+        } else {
+            self.hotwords.as_str()
+        };
         ProviderCredentials {
             api_key: self.api_key.clone(),
             endpoint: self.endpoint.clone(),
+            ws_endpoint: self.ws_endpoint.clone(),
             model: self.model.clone(),
-            // 热词接口（llama-asr 的 prompt 偏置）：从 extra["hotwords"] 读
-            // 逗号/分号/空白分隔的列表。设置页暂不做输入 UI（先不做热词输入），
-            // 此处保留接口——后续要加 UI 时只动前端，后端已就绪。
-            hotwords: self
-                .extra
-                .get("hotwords")
-                .map(|s| {
-                    s.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            region: self.region.clone(),
+            vocabulary_id: self.vocabulary_id.clone(),
+            hotwords: parse_hotwords_text(hotwords_text),
         }
     }
+}
+
+/// 解析热词文本：逗号 / 分号 / 换行 / 空白分隔，每项可用 `词:权重` 指定权重
+///（全角冒号同样识别）。
+///
+/// 权重缺省为 [`Hotword::DEFAULT_WEIGHT`]；冒号后**不是合法 `u8`** 时按整项处理
+/// （如 `http://x:8080`，8080 超出 u8），不会把词截断。权重超界由
+/// [`Hotword::with_weight`] clamp。
+///
+/// 已知歧义：`12:30` 会被读成「词 12、权重 30」而非时间。这是 `词:权重` 语法的
+/// 固有代价，权衡见对应单测。
+fn parse_hotwords_text(s: &str) -> Vec<Hotword> {
+    s.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| match item.rsplit_once([':', '：']) {
+            Some((text, w)) if !text.trim().is_empty() => match w.trim().parse::<u8>() {
+                Ok(weight) => Hotword::with_weight(text.trim(), weight),
+                // 冒号后不是数字 → 冒号是词的一部分（如 URL、时间戳）
+                Err(_) => Hotword::new(item),
+            },
+            _ => Hotword::new(item),
+        })
+        .collect()
+}
+
+/// 一次性迁移引入地域/双端点之前的 qwen 老配置。
+///
+/// **只对 [`QwenAsrProvider`] 生效**：llama-asr 的本地地址没有地域语义，
+/// 套用下面的规则会把它污染成 DashScope 域名。
+///
+/// 以 `region` 是否为空作为「是否已迁移」的判据 —— 迁移过就不再干预，
+/// 尊重用户后续的手改与清空（否则每次启动都会把用户清掉的端点填回去）。
+/// 返回是否有变更，调用方据此决定要不要落盘。
+pub fn migrate_provider_cfg(provider_id: &str, cfg: &mut ProviderConfig) -> bool {
+    if provider_id != QwenAsrProvider::ID || !cfg.region.trim().is_empty() {
+        return false;
+    }
+
+    // 地域推断顺序：端点 host 反推（含业务空间专属域名）→ 默认地域
+    let region = DashScopeRegion::from_endpoint_hint(&cfg.endpoint)
+        .or_else(|| DashScopeRegion::from_endpoint_hint(&cfg.ws_endpoint))
+        .unwrap_or(DashScopeRegion::DEFAULT);
+    cfg.region = region.id().to_string();
+
+    // 老版本的 `ModelInfo.endpoint` 预设会在选中流式模型时把唯一那个 endpoint
+    // 改写成 `wss://...`。不搬走的话，设置页的「非实时端点」输入框里会躺着一个
+    // WebSocket 地址，用户无法理解。
+    let trimmed = cfg.endpoint.trim();
+    if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+        if cfg.ws_endpoint.trim().is_empty() {
+            cfg.ws_endpoint = trimmed.to_string();
+        }
+        cfg.endpoint.clear();
+    }
+
+    // 空端点填该地域默认值：让设置页显示真实生效的地址而非空白
+    // （后端在空值时也会派生同样的默认，这里只是把它显式化）
+    if cfg.endpoint.trim().is_empty() {
+        cfg.endpoint = region.http_endpoint();
+    }
+    if cfg.ws_endpoint.trim().is_empty() {
+        cfg.ws_endpoint = region.ws_endpoint();
+    }
+    true
 }
 
 /// ASR 全局设置。
@@ -267,6 +350,11 @@ pub fn save(app: &AppHandle, s: &AsrSettings) -> Result<(), AsrError> {
 mod tests {
     use super::*;
 
+    /// 取热词文本，便于断言（权重另有专门用例）。
+    fn texts(cred: &ProviderCredentials) -> Vec<&str> {
+        cred.hotwords.iter().map(|h| h.text.as_str()).collect()
+    }
+
     #[test]
     fn to_credentials_parses_hotwords_from_extra() {
         let cfg = ProviderConfig {
@@ -279,9 +367,16 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            ..Default::default()
         };
         let cred = cfg.to_credentials();
-        assert_eq!(cred.hotwords, vec!["Quantinuum", "Anthropic", "量子计算"]);
+        assert_eq!(texts(&cred), vec!["Quantinuum", "Anthropic", "量子计算"]);
+        // 未指定权重 → 默认权重
+        assert!(
+            cred.hotwords
+                .iter()
+                .all(|h| h.weight == Hotword::DEFAULT_WEIGHT)
+        );
     }
 
     #[test]
@@ -299,6 +394,152 @@ mod tests {
             ..Default::default()
         };
         let cred = cfg.to_credentials();
-        assert_eq!(cred.hotwords, vec!["A", "B", "C", "D", "E"]);
+        assert_eq!(texts(&cred), vec!["A", "B", "C", "D", "E"]);
+    }
+
+    #[test]
+    fn top_level_hotwords_takes_precedence_over_extra() {
+        // 顶层是设置页写入的位置；extra 只是历史兼容的兜底
+        let cfg = ProviderConfig {
+            hotwords: "新词".into(),
+            extra: [("hotwords".to_string(), "旧词".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(texts(&cfg.to_credentials()), vec!["新词"]);
+    }
+
+    #[test]
+    fn to_credentials_parses_hotword_weights() {
+        let cfg = ProviderConfig {
+            hotwords: "张三:5, 李四：50, 语音实验室".into(),
+            ..Default::default()
+        };
+        let cred = cfg.to_credentials();
+        assert_eq!(texts(&cred), vec!["张三", "李四", "语音实验室"]);
+        assert_eq!(cred.hotwords[0].weight, 5);
+        // 全角冒号同样识别
+        assert_eq!(cred.hotwords[1].weight, 50);
+        assert_eq!(cred.hotwords[2].weight, Hotword::DEFAULT_WEIGHT);
+    }
+
+    #[test]
+    fn hotword_weight_is_clamped() {
+        let cfg = ProviderConfig {
+            hotwords: "甲:0, 乙:255".into(),
+            ..Default::default()
+        };
+        let cred = cfg.to_credentials();
+        assert_eq!(cred.hotwords[0].weight, 1);
+        assert_eq!(cred.hotwords[1].weight, Hotword::MAX_WEIGHT);
+    }
+
+    #[test]
+    fn colon_that_is_not_a_valid_weight_stays_in_the_word() {
+        // 冒号后不是合法 u8 权重 → 冒号属于词本身，不能把词截断
+        //（8080 超出 u8，解析失败 → 整项保留）
+        let cfg = ProviderConfig {
+            hotwords: "http://example.com:8080".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            texts(&cfg.to_credentials()),
+            vec!["http://example.com:8080"]
+        );
+    }
+
+    #[test]
+    fn trailing_colon_number_is_always_read_as_weight() {
+        // 已知歧义：`12:30` 既可读作时间、也可读作「词 12 权重 30」。
+        // 按阿里云 `词:权重` 的约定的优先级，尾随的 `:数字` 一律判为权重
+        //（30 落在 u8 内）。热词多为产品名/术语，含冒号的写法罕见；
+        // 真要表达字面量，用不含冒号的写法即可。
+        let cfg = ProviderConfig {
+            hotwords: "12:30".into(),
+            ..Default::default()
+        };
+        let cred = cfg.to_credentials();
+        assert_eq!(texts(&cred), vec!["12"]);
+        assert_eq!(cred.hotwords[0].weight, 30);
+    }
+
+    #[test]
+    fn migration_fills_region_and_endpoints_for_fresh_config() {
+        let mut cfg = ProviderConfig::default();
+        assert!(migrate_provider_cfg("qwen-asr", &mut cfg));
+        assert_eq!(cfg.region, DashScopeRegion::DEFAULT.id());
+        assert_eq!(cfg.endpoint, DashScopeRegion::DEFAULT.http_endpoint());
+        assert_eq!(cfg.ws_endpoint, DashScopeRegion::DEFAULT.ws_endpoint());
+    }
+
+    #[test]
+    fn migration_moves_wss_endpoint_out_of_the_http_field() {
+        // 老版本模型预设把 WS 地址写进了唯一的 endpoint 字段
+        let mut cfg = ProviderConfig {
+            endpoint: "wss://dashscope.aliyuncs.com/api-ws/v1/inference".into(),
+            ..Default::default()
+        };
+        assert!(migrate_provider_cfg("qwen-asr", &mut cfg));
+        assert_eq!(
+            cfg.ws_endpoint,
+            "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+        );
+        // HTTP 字段被换成该地域的同步端点，不再是 WebSocket 地址
+        assert_eq!(cfg.endpoint, DashScopeRegion::CnBeijing.http_endpoint());
+    }
+
+    #[test]
+    fn migration_infers_singapore_from_workspace_domain() {
+        let mut cfg = ProviderConfig {
+            endpoint: "https://llm-abc.ap-southeast-1.maas.aliyuncs.com/api/v1".into(),
+            ..Default::default()
+        };
+        assert!(migrate_provider_cfg("qwen-asr", &mut cfg));
+        assert_eq!(cfg.region, "ap-southeast-1");
+        // 用户自填的域名不能被覆盖
+        assert_eq!(
+            cfg.endpoint,
+            "https://llm-abc.ap-southeast-1.maas.aliyuncs.com/api/v1"
+        );
+        assert_eq!(cfg.ws_endpoint, DashScopeRegion::ApSoutheast1.ws_endpoint());
+    }
+
+    #[test]
+    fn migration_preserves_custom_proxy_endpoint() {
+        let mut cfg = ProviderConfig {
+            endpoint: "https://my-proxy.example.com/asr".into(),
+            ..Default::default()
+        };
+        assert!(migrate_provider_cfg("qwen-asr", &mut cfg));
+        // 无法反推地域 → 默认地域，但自建代理地址必须保持原样
+        assert_eq!(cfg.region, DashScopeRegion::DEFAULT.id());
+        assert_eq!(cfg.endpoint, "https://my-proxy.example.com/asr");
+    }
+
+    #[test]
+    fn migration_never_touches_llama_config() {
+        // llama-asr 的本地地址没有地域语义，规则套上去会把它污染成 DashScope 域名
+        let mut cfg = ProviderConfig {
+            endpoint: "http://192.168.1.5:8080".into(),
+            ..Default::default()
+        };
+        assert!(!migrate_provider_cfg("llama-asr", &mut cfg));
+        assert_eq!(cfg.endpoint, "http://192.168.1.5:8080");
+        assert!(cfg.region.is_empty());
+        assert!(cfg.ws_endpoint.is_empty());
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_respects_later_edits() {
+        let mut cfg = ProviderConfig::default();
+        assert!(migrate_provider_cfg("qwen-asr", &mut cfg));
+        // 第二次运行不再报"有变更"（否则每次启动都会落盘）
+        assert!(!migrate_provider_cfg("qwen-asr", &mut cfg));
+
+        // 迁移后用户清空端点：不能被再次填回去
+        cfg.endpoint.clear();
+        assert!(!migrate_provider_cfg("qwen-asr", &mut cfg));
+        assert!(cfg.endpoint.is_empty());
     }
 }

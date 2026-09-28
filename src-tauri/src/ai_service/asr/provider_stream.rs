@@ -35,8 +35,28 @@ use tokio_tungstenite::tungstenite::http;
 use tracing::{debug, warn};
 
 use super::error::AsrError;
+use super::region::DashScopeRegion;
 
-pub const WS_URL: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
+/// 本模块的错误归属：只服务 DashScope 实时端点（唯一调用方是
+/// [`super::provider::QwenAsrProvider`]）。若将来有别的 provider 复用本模块，
+/// 需要把这里的常量换成按调用传入的 provider id，否则错误会归错源。
+const PROVIDER: &str = "qwen-asr";
+
+/// run-task 的可选参数。
+///
+/// **由调用方按模型能力门控后传入**（见 [`super::provider::build_stream_params`]）
+/// —— 本模块只管把拿到的参数塞进报文，不判断哪个模型支持什么：
+/// `parameters.vocabulary`（即时热词）文档明确仅 qwen-audio-3.x 系支持，
+/// 对 fun-asr-realtime / paraformer 系发送很可能直接 400。
+#[derive(Debug, Clone, Default)]
+pub struct StreamParams {
+    /// `parameters.language_hints`；None = 不发。
+    pub language_hint: Option<String>,
+    /// `parameters.vocabulary` 即时热词 `{"词": 权重}`；None = 不发。
+    pub vocabulary: Option<JsonValue>,
+    /// `parameters.vocabulary_id` 预编译热词表 ID；None/空 = 不发。
+    pub vocabulary_id: Option<String>,
+}
 
 /// 流式会话命令（由 session 侧转发）。
 pub enum StreamCommand {
@@ -128,7 +148,7 @@ fn parse_server_event(text: &str) -> Option<ServerEvent> {
 
 /// 构造 run-task（start）事件 JSON。返回 (task_id, body)——
 /// task_id 需在 finish-task 时复用（服务端按 task_id 关联任务）。
-fn build_run_task_payload(model: &str, language_hint: Option<&str>) -> (String, Vec<u8>) {
+fn build_run_task_payload(model: &str, params: &StreamParams) -> (String, Vec<u8>) {
     // task_id：32 位 hex（官方 SDK uuid4().hex）
     let task_id = uuid::Uuid::new_v4().to_string().replace('-', "");
     let mut payload = json!({
@@ -149,8 +169,25 @@ fn build_run_task_payload(model: &str, language_hint: Option<&str>) -> (String, 
             "function": "recognition"
         }
     });
-    if let Some(lang) = language_hint {
-        payload["payload"]["parameters"]["language_hints"] = json!([lang]);
+    let p = &mut payload["payload"]["parameters"];
+    if let Some(lang) = params
+        .language_hint
+        .as_deref()
+        .filter(|l| !l.trim().is_empty())
+    {
+        p["language_hints"] = json!([lang]);
+    }
+    // 即时热词（仅 qwen-audio-3.x-asr-flash-streaming 支持，门控在调用方）
+    if let Some(vocab) = &params.vocabulary {
+        p["vocabulary"] = vocab.clone();
+    }
+    // 预编译热词表 ID（fun-asr-realtime / paraformer 系走这条）
+    if let Some(id) = params
+        .vocabulary_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        p["vocabulary_id"] = json!(id);
     }
     (
         task_id,
@@ -184,11 +221,12 @@ pub async fn start_streaming(
     endpoint: String,
     api_key: String,
     model: String,
-    language_hint: Option<String>,
+    params: StreamParams,
 ) -> Result<mpsc::UnboundedSender<StreamCommand>, AsrError> {
-    // 端点可配置：设置为空时用默认 WS_URL
+    // 端点由调用方按地域派生（DashScopeRegion::ws_endpoint）后传入；
+    // 这里只做兜底，避免空串拼出非法 URL
     let ws_url = if endpoint.trim().is_empty() {
-        WS_URL.to_string()
+        DashScopeRegion::DEFAULT.ws_endpoint()
     } else {
         endpoint
     };
@@ -207,11 +245,11 @@ pub async fn start_streaming(
     let (ws, _resp) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|e| AsrError::ProviderApiError {
-            provider: "qwen-asr".into(),
+            provider: PROVIDER.into(),
             message: format!("WebSocket 连接失败: {e}"),
         })?;
     let mut ws = ws;
-    let (task_id, run_task_body) = build_run_task_payload(&model, language_hint.as_deref());
+    let (task_id, run_task_body) = build_run_task_payload(&model, &params);
     ws.send(Message::Text(
         String::from_utf8(run_task_body)
             .expect("run-task 是合法 UTF-8")
@@ -219,7 +257,7 @@ pub async fn start_streaming(
     ))
     .await
     .map_err(|e| AsrError::ProviderApiError {
-        provider: "qwen-asr".into(),
+        provider: PROVIDER.into(),
         message: format!("发送 run-task 失败: {e}"),
     })?;
 
@@ -261,7 +299,7 @@ pub async fn start_streaming(
                             {
                                 if let Some(r) = pending_reply.take() {
                                     let _ = r.send(Err(AsrError::ProviderApiError {
-                                        provider: "qwen-asr".into(),
+                                        provider: PROVIDER.into(),
                                         message: "发送 finish-task 失败".into(),
                                     }));
                                 }
@@ -325,7 +363,7 @@ pub async fn start_streaming(
                                     warn!("[ASR/stream] 服务端错误: {code} {message}");
                                     if let Some(r) = pending_reply.take() {
                                         let _ = r.send(Err(AsrError::ProviderApiError {
-                                            provider: "qwen-asr".into(),
+                                            provider: PROVIDER.into(),
                                             message: format!("{code}: {message}"),
                                         }));
                                     }
@@ -343,7 +381,7 @@ pub async fn start_streaming(
                             warn!("[ASR/stream] 连接错误: {e}");
                             if let Some(r) = pending_reply.take() {
                                 let _ = r.send(Err(AsrError::ProviderApiError {
-                                    provider: "qwen-asr".into(),
+                                    provider: PROVIDER.into(),
                                     message: format!("连接错误: {e}"),
                                 }));
                             }
@@ -429,7 +467,11 @@ mod tests {
 
     #[test]
     fn run_task_payload_has_required_fields() {
-        let (task_id, body) = build_run_task_payload("paraformer-realtime-v2", Some("zh"));
+        let params = StreamParams {
+            language_hint: Some("zh".into()),
+            ..Default::default()
+        };
+        let (task_id, body) = build_run_task_payload("paraformer-realtime-v2", &params);
         let v: JsonValue = serde_json::from_slice(&body).expect("合法 JSON");
         assert_eq!(v["header"]["action"], "run-task");
         assert_eq!(v["header"]["streaming"], "duplex");
@@ -449,5 +491,45 @@ mod tests {
             serde_json::from_slice(&build_finish_task_payload(&task_id)).expect("合法 JSON");
         assert_eq!(finish["header"]["action"], "finish-task");
         assert_eq!(finish["header"]["task_id"], task_id);
+    }
+
+    #[test]
+    fn run_task_omits_absent_optional_params() {
+        // 门控在调用方：None 时字段必须**不出现**，而不是出现为 null
+        //（对不支持的模型发这些参数可能直接 400）
+        let (_, body) = build_run_task_payload("paraformer-realtime-v2", &StreamParams::default());
+        let v: JsonValue = serde_json::from_slice(&body).expect("合法 JSON");
+        let p = &v["payload"]["parameters"];
+        assert!(p.get("language_hints").is_none());
+        assert!(p.get("vocabulary").is_none());
+        assert!(p.get("vocabulary_id").is_none());
+    }
+
+    #[test]
+    fn run_task_includes_vocabulary_and_vocabulary_id_when_present() {
+        let params = StreamParams {
+            language_hint: None,
+            vocabulary: Some(json!({"张三": 5})),
+            vocabulary_id: Some("vocab-abc".into()),
+        };
+        let (_, body) = build_run_task_payload("qwen-audio-3.0-asr-flash-streaming", &params);
+        let v: JsonValue = serde_json::from_slice(&body).expect("合法 JSON");
+        assert_eq!(v["payload"]["parameters"]["vocabulary"]["张三"], 5);
+        assert_eq!(v["payload"]["parameters"]["vocabulary_id"], "vocab-abc");
+    }
+
+    #[test]
+    fn run_task_skips_blank_optional_strings() {
+        // 空串与纯空白等同未配置，不能发出去
+        let params = StreamParams {
+            language_hint: Some("   ".into()),
+            vocabulary: None,
+            vocabulary_id: Some("  ".into()),
+        };
+        let (_, body) = build_run_task_payload("paraformer-realtime-v2", &params);
+        let v: JsonValue = serde_json::from_slice(&body).expect("合法 JSON");
+        let p = &v["payload"]["parameters"];
+        assert!(p.get("language_hints").is_none());
+        assert!(p.get("vocabulary_id").is_none());
     }
 }

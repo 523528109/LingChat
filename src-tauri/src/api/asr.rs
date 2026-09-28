@@ -18,12 +18,55 @@ use crate::ai_service::asr::debug_log;
 use crate::ai_service::asr::error::AsrError;
 #[cfg(desktop)]
 use crate::ai_service::asr::global_hotkey;
-use crate::ai_service::asr::provider::{self, AsrResult, ProviderInfo, list_provider_info};
+use crate::ai_service::asr::provider::{
+    self, AsrOptions, AsrResult, Hotword, ProviderInfo, list_provider_info,
+};
 use crate::ai_service::asr::session::{AsrSession, AsrSource};
 use crate::ai_service::asr::settings::{self, AsrSettings};
 
 fn parse_source(s: &str) -> Result<AsrSource, String> {
     AsrSource::from_str(s).ok_or_else(|| format!("invalid source: {s}"))
+}
+
+/// 命令层的热词入参，兼容两种 JSON 形态：
+///
+/// ```json
+/// ["量子计算", "Anthropic"]                    // 纯词表，用默认权重
+/// [{"text": "量子计算", "weight": 5}]          // 带权重
+/// ```
+///
+/// 本次没有「角色级热词」来源，前端可以一直传 `None`（走 provider 配置级兜底）；
+/// 未来接入角色级热词时只需在调用处填这个参数，**provider 侧零改动**。
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+pub enum HotwordInput {
+    Text(String),
+    Weighted { text: String, weight: Option<u8> },
+}
+
+impl HotwordInput {
+    fn into_hotword(self) -> Hotword {
+        match self {
+            Self::Text(t) => Hotword::new(t),
+            Self::Weighted { text, weight } => match weight {
+                Some(w) => Hotword::with_weight(text, w),
+                None => Hotword::new(text),
+            },
+        }
+    }
+}
+
+/// 组装一次识别调用的参数。空词条（含只输空白的）直接丢弃。
+fn build_options(language_hint: Option<String>, hotwords: Option<Vec<HotwordInput>>) -> AsrOptions {
+    AsrOptions {
+        language_hint,
+        hotwords: hotwords
+            .unwrap_or_default()
+            .into_iter()
+            .map(HotwordInput::into_hotword)
+            .filter(|h| !h.text.trim().is_empty())
+            .collect(),
+    }
 }
 
 /// 错误转前端可读字符串：`{"code":"<i18n_code>","detail":"<详情>"}` JSON。
@@ -144,6 +187,7 @@ pub async fn asr_recognize_wav(
     provider_id: String,
     wav_bytes: Vec<u8>,
     language_hint: Option<String>,
+    hotwords: Option<Vec<HotwordInput>>,
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AsrResult, String> {
@@ -156,9 +200,14 @@ pub async fn asr_recognize_wav(
     let p = resolve_provider(&providers, &provider_id, &app, &http)
         .await
         .map_err(|e| err_to_user(&e))?;
-    tracing::info!("[ASR] 发送音频到 {provider_id}: {} bytes", wav_bytes.len());
+    let opts = build_options(language_hint, hotwords);
+    tracing::info!(
+        "[ASR] 发送音频到 {provider_id}: {} bytes, {} 条热词",
+        wav_bytes.len(),
+        opts.hotwords.len()
+    );
     let result = tokio::select! {
-        result = p.recognize(wav_bytes, language_hint.as_deref()) => result,
+        result = p.recognize(wav_bytes, &opts) => result,
         _ = cancel_child.cancelled() => Err(AsrError::Canceled),
     };
     match result {
@@ -184,6 +233,7 @@ pub async fn asr_recognize_wav(
 pub async fn asr_recognize_wav_stream(
     provider_id: String,
     wav_bytes: Vec<u8>,
+    hotwords: Option<Vec<HotwordInput>>,
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AsrResult, String> {
@@ -206,8 +256,9 @@ pub async fn asr_recognize_wav_stream(
         Some(std::sync::Arc::new(move |text: &str| {
             let _ = app_handle.emit("asr://stream_partial", text.to_string());
         }));
+    let opts = build_options(None, hotwords);
     let result = tokio::select! {
-        result = p.stream_recognize(wav_bytes, on_partial) => result,
+        result = p.stream_recognize(wav_bytes, &opts, on_partial) => result,
         _ = cancel_child.cancelled() => Err(AsrError::Canceled),
     };
     match result {
@@ -261,6 +312,7 @@ pub async fn asr_cancel(state: tauri::State<'_, AppState>) -> Result<(), String>
 pub async fn asr_start_streaming(
     provider_id: String,
     language_hint: Option<String>,
+    hotwords: Option<Vec<HotwordInput>>,
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
@@ -277,27 +329,30 @@ pub async fn asr_start_streaming(
         return Err(err_to_user(&AsrError::StreamingNotSupported(provider_id)));
     }
     let settings = settings::load(&app).map_err(|e| err_to_user(&e))?;
-    let cred = settings
+    let creds = settings
         .provider_configs
         .get(&provider_id)
         .cloned()
-        .unwrap_or_default();
-    // 流式模型：配置为空或为非流式模型（实时端点不认识 fun-asr-realtime，
-    // 会返回 400 url error）→ 回退默认流式模型
-    let model = if cred.model.is_empty() || !provider::qwen_is_streaming_model(&cred.model) {
-        "paraformer-realtime-v2".to_string()
+        .unwrap_or_default()
+        .to_credentials();
+    // 流式模型回退：配置为空、或配了非流式模型（实时端点不认识它们，
+    // 会返回 400 url error）→ 该地域的流式默认模型。
+    // **仅 qwen provider 参与回退**：其它 provider 的模型名不能套 qwen 的清单
+    //（旧实现在这里写死 "paraformer-realtime-v2" 且不判断 provider，会把 qwen
+    // 的模型名塞给 llama-asr 之类的 provider）。
+    let model = if provider_id == provider::QwenAsrProvider::ID {
+        let m = creds.model.trim();
+        if m.is_empty() || !provider::qwen_is_streaming_model(m) {
+            provider::qwen_default_model(true, creds.region_enum()).to_string()
+        } else {
+            m.to_string()
+        }
     } else {
-        cred.model
+        creds.model.clone()
     };
+    let opts = build_options(language_hint, hotwords);
     session
-        .start_streaming(
-            &app,
-            &provider_id,
-            cred.endpoint,
-            cred.api_key,
-            model,
-            language_hint,
-        )
+        .start_streaming(&app, &provider_id, &creds, &model, &opts)
         .await
         .map_err(|e| err_to_user(&e))
 }
@@ -429,8 +484,10 @@ pub async fn asr_test_provider(
         .await
         .map_err(|e| err_to_user(&e))?;
     tracing::info!("[ASR] 测试连接: 发送静音探测到 {provider_id}");
+    // 探测不带热词（只验连通性与 key 合法性）
+    let opts = AsrOptions::default();
     let result = tokio::select! {
-        result = p.recognize(silence_wav, None) => result,
+        result = p.recognize(silence_wav, &opts) => result,
         _ = cancel_child.cancelled() => Err(AsrError::Canceled),
     };
     match result {

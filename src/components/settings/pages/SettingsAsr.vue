@@ -214,6 +214,16 @@
               class="h-4 w-4 accent-(--accent-color)"
             />
           </label>
+          <!-- 下拉单选（地域等枚举字段）：选项由后端 config_fields[].options 提供 -->
+          <select
+            v-else-if="field.kind === 'select'"
+            v-model="providerCfgRecord[field.key]"
+            class="shadow-glass focus:border-brand focus:ring-brand/20 w-full rounded-lg border border-white/10 bg-white/10 px-3 py-2.5 text-sm text-sky-400 backdrop-blur-xl backdrop-saturate-150 transition-all duration-200 focus:ring-2 focus:outline-none"
+          >
+            <option v-for="opt in field.options ?? []" :key="opt.value" :value="opt.value">
+              {{ opt.label }}
+            </option>
+          </select>
           <input
             v-else
             type="text"
@@ -221,6 +231,9 @@
             :placeholder="field.placeholder"
             class="shadow-glass focus:border-brand focus:ring-brand/20 w-full rounded-lg border border-white/10 bg-white/10 px-3 py-2.5 text-sm text-white backdrop-blur-xl backdrop-saturate-150 transition-all duration-200 focus:ring-2 focus:outline-none"
           />
+          <!-- 字段说明：后端每个 config_field 都带 hint，此前模板从未渲染（一直不可见）。
+               地域/热词表 ID 这类「不看说明一定填错」的字段依赖它 -->
+          <p v-if="field.hint" class="mt-1.5 block text-sm text-gray-300">{{ field.hint }}</p>
           <p v-if="field.key === 'model' && modelListError" class="mt-1 text-sm text-red-400">
             {{ modelListError }}
           </p>
@@ -298,7 +311,7 @@ import { useUIStore } from "@/stores/modules/ui/ui";
 import { asrListModels, asrRecognizeWav, asrGetStatus } from "@/api/services/asr";
 import { pcmToWavPcm16, trimSilencePcm } from "@/utils/asrAudio";
 import { parseAsrError } from "@/utils/asrError";
-import type { AsrSettings, SendMode, ProviderInfo } from "@/api/services/asr";
+import type { AsrSettings, SendMode, ProviderInfo, AsrRegionInfo } from "@/api/services/asr";
 
 const { t, te } = useI18n();
 const asrStore = useAsrStore();
@@ -413,24 +426,90 @@ const sendModeOptions = computed<{ value: SendMode; label: string }[]>(() => [
   { value: "auto_send", label: t("settings.asr.sendMode.autoSend") },
 ]);
 
-// ── 模型预设：来自后端模型元数据（ModelInfo.endpoint，单一数据源）──
-// 选中模型时同步填入 model + 端点预设（用户手改的 endpoint 被覆盖，与 LLM 预设一致）；
-// llama-asr 的端点与模型无关（endpoint=None），只填 model。
+const activeProviderInfo = computed<ProviderInfo | undefined>(() =>
+  asrStore.providers.find((p) => p.id === localSettings.value.active_provider),
+);
 
-/** 应用模型预设：填 model + 端点预设（来自后端模型元数据） */
+// ProviderConfig 是后端约定的具名键（api_key / endpoint / extra），
+// 而 config_field.key 是动态字符串，需要做 Record 桥接才能用 v-model 写入任意键。
+// 只读：写路径走 ensureProviderConfig + debounce save。
+//
+// **声明位置必须在这里（靠前）**：下面的地域辅助函数与 provider/地域 watch 都要读
+// 它，而模板渲染与 `immediate: true` 的 watch 都会在 setup 阶段求值 —— 声明得比
+// 使用点晚会命中 TDZ 抛 ReferenceError，整个 <script setup> 失败、设置页空白。
+const providerCfg = computed(() => {
+  const id = localSettings.value.active_provider;
+  return localSettings.value.provider_configs[id] ?? { api_key: "", endpoint: "" };
+});
+const providerCfgRecord = computed(() => providerCfg.value as unknown as Record<string, string>);
+
+// ── 地域联动：端点默认值的单一数据源在后端 ProviderInfo.regions ──
+// 前端不硬编码任何域名（否则会形成两份真相）。
+
+/** 当前 provider 的可选地域；无地域概念的 provider（如 llama-asr）为空数组 */
+const providerRegions = computed(() => activeProviderInfo.value?.regions ?? []);
+
+/** 当前生效的地域信息（按配置的 region id 查，缺失回退第一个） */
+const activeRegion = computed<AsrRegionInfo | undefined>(() => {
+  const regions = providerRegions.value;
+  if (regions.length === 0) return undefined;
+  return regions.find((r) => r.id === (providerCfg.value.region ?? "")) ?? regions[0];
+});
+
+/** 该端点值是否恰好等于某个地域的默认端点（用于判断「未被用户手改过」） */
+function isKnownRegionEndpoint(value: string): boolean {
+  return providerRegions.value.some((r) => r.http_endpoint === value || r.ws_endpoint === value);
+}
+
+/**
+ * 把两个端点字段指向当前地域的默认值。
+ *
+ * 覆盖规则：**只改写「空」或「恰好等于某个地域默认端点」的值**——用户手填的
+ * 业务空间专属域名 / 自建代理一律不动。没有这条规则，切地域会吃掉用户的配置。
+ */
+function applyRegionEndpoints() {
+  const region = activeRegion.value;
+  if (!region) return;
+  const record = providerCfg.value as unknown as Record<string, string>;
+  const pairs: [string, string][] = [
+    ["endpoint", region.http_endpoint],
+    ["ws_endpoint", region.ws_endpoint],
+  ];
+  for (const [key, next] of pairs) {
+    const cur = (record[key] ?? "").trim();
+    if (!cur || isKnownRegionEndpoint(cur)) {
+      record[key] = next;
+    }
+  }
+}
+
+/**
+ * 校验当前模型在（新的）地域下是否可用，不可用则回退为该地域的默认模型。
+ *
+ * 模型清单是地域相关的（如 fun-asr-realtime-2026-02-28 仅北京可用），留着
+ * 一个该地域不存在的模型名会让后端请求直接 400。清单为空（拉取失败）时不改，
+ * 避免网络问题误清用户配置；模型为空也不改——后端本就会回退地域默认。
+ */
+function ensureModelValidForRegion() {
+  const models = asrStore.models;
+  if (models.length === 0) return;
+  const cfg = localSettings.value.provider_configs[localSettings.value.active_provider];
+  if (!cfg) return;
+  const cur = (cfg.model ?? "").trim();
+  if (!cur || models.some((m) => m.id === cur)) return;
+  const fallback = models.find((m) => m.is_default) ?? models[0];
+  cfg.model = fallback.id;
+}
+
+/** 应用模型预设：填 model，并确保两个端点字段已按当前地域填好。
+ *  端点拆成 HTTP/WS 两个独立字段后，切模型不再需要改写地址（协议已由字段区分）。 */
 function applyAsrPreset(model: string) {
   const cfg = localSettings.value.provider_configs[localSettings.value.active_provider];
   const m = asrStore.models.find((x) => x.id === model);
   if (!cfg || !m) return;
   cfg.model = m.id;
-  if (m.endpoint) {
-    cfg.endpoint = m.endpoint;
-  }
+  applyRegionEndpoints();
 }
-
-const activeProviderInfo = computed<ProviderInfo | undefined>(() =>
-  asrStore.providers.find((p) => p.id === localSettings.value.active_provider),
-);
 
 /** 模型列表拉取失败信息（llama-asr 服务未启动等），显示在模型字段下方 */
 const modelListError = ref("");
@@ -459,15 +538,6 @@ const activeModel = computed(() => {
   const id = localSettings.value.provider_configs[localSettings.value.active_provider]?.model ?? "";
   return asrStore.models.find((m) => m.id === id) ?? asrStore.models.find((m) => m.is_default);
 });
-watch(
-  () => localSettings.value.active_provider,
-  (id) => {
-    ensureProviderConfig(id);
-    void loadModels(id);
-  },
-  { immediate: true },
-);
-
 // 流式开关可用性：当前生效模型的流式能力（模型级权威判定）
 const providerSupportsStreaming = computed(() => activeModel.value?.supports_streaming ?? false);
 
@@ -516,20 +586,22 @@ function ensureProviderConfig(id: string) {
     }
   });
 }
+// provider / 地域变更的统一入口。
+//
+// **必须是一个 watch、且内部顺序固定**（先 ensureProviderConfig 再
+// applyRegionEndpoints）：拆成两个 watch 会依赖注册顺序——若默认值先被填成
+// 另一地域的地址，随后又因「不等于任何地域默认端点」被判为用户手填而拒绝改写，
+// 就会留下错误的端点。
 watch(
-  () => localSettings.value.active_provider,
-  (id) => ensureProviderConfig(id),
+  [() => localSettings.value.active_provider, () => providerCfg.value.region],
+  async ([id]) => {
+    ensureProviderConfig(id);
+    applyRegionEndpoints();
+    await loadModels(id);
+    ensureModelValidForRegion();
+  },
   { immediate: true },
 );
-
-// ProviderConfig 是后端约定的具名键（api_key / endpoint / extra），
-// 而 config_field.key 是动态字符串，需要做 Record 桥接才能用 v-model 写入任意键。
-// 只读：写路径走 watch 的 ensureProviderConfig + debounce save。
-const providerCfg = computed(() => {
-  const id = localSettings.value.active_provider;
-  return localSettings.value.provider_configs[id] ?? { api_key: "", endpoint: "" };
-});
-const providerCfgRecord = computed(() => providerCfg.value as unknown as Record<string, string>);
 
 const statusText = computed(() => {
   if (!asrStore.lastError) return t("settings.asr.status.ready");

@@ -12,6 +12,7 @@ pub mod global_hotkey;
 pub mod provider;
 pub mod provider_stream;
 pub mod provider_stream_llama;
+pub mod region;
 pub mod session;
 pub mod settings;
 pub mod vad;

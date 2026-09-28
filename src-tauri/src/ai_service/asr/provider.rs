@@ -46,6 +46,7 @@ use serde_json::{Value as JsonValue, json};
 use tracing::{debug, instrument, warn};
 
 use super::error::AsrError;
+use super::region::DashScopeRegion;
 
 // ============================================================================
 // 公共结果类型
@@ -80,9 +81,25 @@ pub enum ConfigFieldKind {
     Number,
     /// 布尔开关。
     Boolean,
+    /// 下拉单选（配合 [`AsrConfigField::options`]，如地域选择）。
+    Select,
+}
+
+/// [`ConfigFieldKind::Select`] 的一个选项。
+#[derive(Debug, Clone, Serialize)]
+pub struct AsrConfigFieldOption {
+    /// 写入配置的值。
+    pub value: &'static str,
+    /// UI 显示名。
+    pub label: &'static str,
 }
 
 /// provider 在 UI 上展示需要填写的字段。
+///
+/// **注意**：字段 key 会被前端写成 `provider_configs[id]` 的**顶层键**
+/// （见 SettingsAsr.vue 的 `providerCfgRecord[field.key]`），而 `ProviderConfig`
+/// 是没有 `deny_unknown_fields` 的固定 struct —— 新增字段必须同步加进 struct，
+/// 否则用户设置后会被 serde 静默丢弃、刷新即失。
 #[derive(Debug, Clone, Serialize)]
 pub struct AsrConfigField {
     /// 字段 key（写入 `provider_configs[id].<key>`）。
@@ -97,8 +114,11 @@ pub struct AsrConfigField {
     pub default_value: Option<&'static str>,
     /// 占位提示文字。
     pub placeholder: Option<&'static str>,
-    /// 提示说明（鼠标悬停显示）。
+    /// 提示说明（显示在输入框下方）。
     pub hint: Option<&'static str>,
+    /// [`ConfigFieldKind::Select`] 的选项列表；其它类型为空。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<AsrConfigFieldOption>,
 }
 
 /// provider 静态元数据（id / 显示名 / 配置字段）。
@@ -110,28 +130,112 @@ pub struct ProviderInfo {
     pub display_name: &'static str,
     /// 简短描述。
     pub description: &'static str,
-    /// 默认 endpoint。
-    pub default_endpoint: &'static str,
     /// 是否支持流式协议（前端据此决定流式开关是否可用）。
     pub supports_streaming: bool,
     /// UI 需要展示的配置字段。
     pub config_fields: Vec<AsrConfigField>,
+    /// 该 provider 可选的地域列表（含各地域的端点默认值）。
+    ///
+    /// 空数组 = 该 provider 无地域概念（如本地 llama-asr），前端不渲染地域下拉。
+    /// 非空时，前端切地域会按这里的 `http_endpoint` / `ws_endpoint` 自动填端点
+    /// —— 端点默认值的单一真相在后端（与 `ModelInfo` 的预设机制一致）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<super::region::AsrRegionInfo>,
+}
+
+// ============================================================================
+// 热词与调用级参数
+// ============================================================================
+
+/// 一条热词。
+///
+/// `weight` 只对 DashScope 的**即时热词**（`parameters.vocabulary`）有意义；
+/// 预编译热词（`vocabulary_id`）与本地 llama-asr 的 `prompt` 偏置都忽略它。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hotword {
+    pub text: String,
+    pub weight: u8,
+}
+
+impl Hotword {
+    /// 默认权重。DashScope 文档推荐从 4 起测。
+    pub const DEFAULT_WEIGHT: u8 = 4;
+    /// 权重上界：50 是文档里的「超级热词」特殊值（召回率大幅提升，最多 50 个）。
+    pub const MAX_WEIGHT: u8 = 50;
+
+    /// 用默认权重构造。
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            weight: Self::DEFAULT_WEIGHT,
+        }
+    }
+
+    /// 指定权重构造（clamp 到 `1..=MAX_WEIGHT`）。
+    pub fn with_weight(text: impl Into<String>, weight: u8) -> Self {
+        Self {
+            text: text.into(),
+            weight: weight.clamp(1, Self::MAX_WEIGHT),
+        }
+    }
+
+    /// 纯词表 → 热词列表（统一用默认权重的降级入口）。
+    pub fn from_text_list<I, S>(texts: I) -> Vec<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        texts
+            .into_iter()
+            .map(|t| Self::new(t))
+            .filter(|h| !h.text.trim().is_empty())
+            .collect()
+    }
+}
+
+/// 一次识别调用的可选参数。
+///
+/// 用结构体而非继续加函数参数：热词之后还会有采样率、角色 id（日志归因）等，
+/// 参数列表会持续膨胀，而调用点数量有限，一次改到位成本更低。
+#[derive(Debug, Clone, Default)]
+pub struct AsrOptions {
+    /// 可选 BCP-47 语言码，如 `"zh"` / `"en"` / `"ja"`。
+    pub language_hint: Option<String>,
+    /// **按调用传入**的热词（未来 = 当前角色的热词，随角色切换而变）。
+    ///
+    /// 非空时**覆盖** provider 配置级热词（`ProviderCredentials::hotwords`）；
+    /// 空时回退到配置级。合并规则集中在
+    /// [`ProviderCredentials::effective_hotwords`]，各 provider 不再自行判断
+    /// —— 后续接入角色级热词时无需改动任何 provider。
+    pub hotwords: Vec<Hotword>,
 }
 
 // ============================================================================
 // Provider 凭证（最小子集，不依赖 settings.rs）
 // ============================================================================
 
-/// provider 运行时凭证：api_key + endpoint + model + 热词。
+/// provider 运行时凭证：api_key + 端点 + model + 地域 + 热词。
 #[derive(Debug, Clone, Default)]
 pub struct ProviderCredentials {
     pub api_key: String,
+    /// 同步（非实时）识别端点；空/非 http(s) = 按 [`Self::region_enum`] 派生。
     pub endpoint: String,
-    /// 识别的模型名；空串 = provider 默认模型（如 qwen 的 fun-asr-realtime）。
+    /// 实时识别 WebSocket 端点；空/非 ws(s) = 按 [`Self::region_enum`] 派生。
+    ///
+    /// 与 [`Self::endpoint`] **分开**存储：两者协议不同，且用户可能只覆盖其一
+    /// （业务空间专属域名 / 自建代理的 HTTP 与 WS 未必同源）。历史上共用一个
+    /// 字段，选中流式模型时会被 `ModelInfo` 预设改写成 `wss://`，导致同步路径
+    /// 拿到一个 WebSocket 地址——拆开是对这个既有问题的根治。
+    pub ws_endpoint: String,
+    /// 识别的模型名；空串 = provider 默认模型。
     pub model: String,
-    /// 热词列表（llama-asr 的 `prompt` 偏置字段；qwen 忽略）。
-    /// 来源 `ProviderConfig.extra["hotwords"]`（逗号分隔，见 settings.rs）。
-    pub hotwords: Vec<String>,
+    /// 地域 id（见 [`super::region::DashScopeRegion`]）；空/未知 = 默认地域。
+    pub region: String,
+    /// 预编译热词列表 ID。仅 `fun-asr-realtime` / `paraformer-realtime` 系支持
+    /// （`qwen-audio-3.x` 系走即时热词，见 [`Self::hotwords`]）。
+    pub vocabulary_id: String,
+    /// provider 配置级热词（兜底）。被 [`AsrOptions::hotwords`] 覆盖。
+    pub hotwords: Vec<Hotword>,
 }
 
 impl ProviderCredentials {
@@ -143,6 +247,47 @@ impl ProviderCredentials {
     /// api_key 是否非空（剪掉首尾空白后判断）。
     pub fn has_api_key(&self) -> bool {
         !self.api_key.trim().is_empty()
+    }
+
+    /// 解析后的地域（空/未知 → 默认地域）。
+    pub fn region_enum(&self) -> super::region::DashScopeRegion {
+        super::region::DashScopeRegion::parse(&self.region)
+    }
+
+    /// 实际使用的同步端点：配置为空或非 http(s) 时按地域派生默认。
+    ///
+    /// 「非 http(s) 一律回退」同时是历史数据的防御：老配置里 `endpoint` 可能被
+    /// 模型预设写成 `wss://...`（见 [`Self::ws_endpoint`] 的说明），直接拿去发
+    /// HTTP 请求会让 reqwest 报 builder error。
+    pub fn effective_http_endpoint(&self) -> String {
+        let e = self.normalized_endpoint();
+        if e.starts_with("http://") || e.starts_with("https://") {
+            e
+        } else {
+            self.region_enum().http_endpoint()
+        }
+    }
+
+    /// 实际使用的实时端点：配置为空或非 ws(s) 时按地域派生默认。
+    ///
+    /// 注意裁剪的是 [`Self::ws_endpoint`] 而不是 [`Self::endpoint`] —— 两者是
+    /// 独立的配置项，取错字段会让用户手填的 WS 地址被静默忽略。
+    pub fn effective_ws_endpoint(&self) -> String {
+        let e = self.ws_endpoint.trim_end_matches('/');
+        if e.starts_with("wss://") || e.starts_with("ws://") {
+            e.to_string()
+        } else {
+            self.region_enum().ws_endpoint()
+        }
+    }
+
+    /// 本次调用生效的热词：调用级非空则覆盖配置级，否则回退配置级。
+    pub fn effective_hotwords(&self, opts: &AsrOptions) -> Vec<Hotword> {
+        if opts.hotwords.is_empty() {
+            self.hotwords.clone()
+        } else {
+            opts.hotwords.clone()
+        }
     }
 }
 
@@ -165,14 +310,12 @@ pub trait AsrProvider: Send + Sync {
     /// 调用云 API 识别一段 WAV 字节。
     ///
     /// - `wav_bytes`：前端 OfflineAudioContext 重采样后的 16kHz mono WAV。
-    /// - `language_hint`：可选 BCP-47 码，如 `"zh"` / `"en"` / `"ja"`。
+    /// - `opts`：本次调用的可选参数（语言提示 + 热词）。热词走这里而非
+    ///   `ProviderCredentials`，是因为它的来源是**当前角色**，随角色切换而变。
     ///
     /// 错误统一返回 [`AsrError`]。
-    async fn recognize(
-        &self,
-        wav_bytes: Vec<u8>,
-        language_hint: Option<&str>,
-    ) -> Result<AsrResult, AsrError>;
+    async fn recognize(&self, wav_bytes: Vec<u8>, opts: &AsrOptions)
+    -> Result<AsrResult, AsrError>;
 
     /// 是否支持流式协议（WebSocket 实时识别）。默认不支持。
     fn supports_streaming(&self) -> bool {
@@ -191,6 +334,7 @@ pub trait AsrProvider: Send + Sync {
     async fn stream_recognize(
         &self,
         _wav_bytes: Vec<u8>,
+        _opts: &AsrOptions,
         _on_partial: Option<Arc<dyn for<'a> Fn(&'a str) + Send + Sync + 'static>>,
     ) -> Result<AsrResult, AsrError> {
         Err(AsrError::StreamingNotSupported(self.id().into()))
@@ -211,11 +355,8 @@ pub struct QwenAsrProvider {
 }
 
 impl QwenAsrProvider {
-    const ID: &'static str = "qwen-asr";
-    const DISPLAY: &'static str = "Qwen ASR";
-    const DEFAULT_ENDPOINT: &'static str =
-        "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation";
-    const MODEL: &'static str = "fun-asr-realtime";
+    pub const ID: &'static str = "qwen-asr";
+    pub const DISPLAY: &'static str = "Qwen ASR（阿里云百炼）";
 
     pub fn new(http: reqwest::Client, cred: ProviderCredentials) -> Result<Self, AsrError> {
         if !cred.has_api_key() {
@@ -225,6 +366,36 @@ impl QwenAsrProvider {
         }
         Ok(Self { http, cred })
     }
+
+    /// 同步路径生效的模型。
+    ///
+    /// 配置为空、或配了一个流式模型（同步端点不认识它们，DashScope 会返回
+    /// HTTP 400 "url error"）→ 回退到该地域的同步默认模型。
+    fn effective_batch_model(&self) -> &str {
+        let m = self.cred.model.trim();
+        if m.is_empty() || qwen_is_streaming_model(m) {
+            qwen_default_model(false, self.cred.region_enum())
+        } else {
+            m
+        }
+    }
+}
+
+/// 热词列表 → DashScope 即时热词对象 `{"词": 权重}`。
+///
+/// 同词重复时保留**先出现**的权重（调用方已按优先级排序，见
+/// [`AsrOptions::hotwords`] 的覆盖语义）。
+fn hotwords_to_vocabulary_json(hotwords: &[Hotword]) -> JsonValue {
+    let mut map = serde_json::Map::new();
+    for h in hotwords {
+        let text = h.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        map.entry(text.to_string())
+            .or_insert_with(|| json!(h.weight));
+    }
+    JsonValue::Object(map)
 }
 
 #[async_trait]
@@ -245,53 +416,58 @@ impl AsrProvider for QwenAsrProvider {
         true
     }
 
-    #[instrument(skip(self, wav_bytes), fields(provider = Self::ID))]
+    #[instrument(skip(self, wav_bytes, opts), fields(provider = Self::ID))]
     async fn recognize(
         &self,
         wav_bytes: Vec<u8>,
-        language_hint: Option<&str>,
+        opts: &AsrOptions,
     ) -> Result<AsrResult, AsrError> {
-        // 非流式端点校验：仅接受 http(s) URL。流式预设（wss://...）或空值
-        // 一律回退默认 HTTP 端点——否则 reqwest 对 wss:// 报 builder error。
-        let endpoint = {
-            let e = self.cred.normalized_endpoint();
-            if e.is_empty() || !(e.starts_with("http://") || e.starts_with("https://")) {
-                Self::DEFAULT_ENDPOINT.to_string()
-            } else {
-                e
-            }
-        };
-
-        // DashScope 非实时 Fun-ASR-Realtime 协议（multimodal-generation）：
-        // JSON body + audio 以 data URL（base64 inline）放在 user message 里。
-        // 参考官方 SDK Recognition.call + 文档「非实时语音识别（Fun-ASR-Realtime）API参考」。
-        // 注：language_hints 仅 paraformer-realtime-v2 支持，fun-asr-realtime 不传。
-        let _ = language_hint;
-        // 模型自选：cred.model 为空或为流式模型（非流式端点不认识）→ 回退默认非流式模型。
-        // 流式模型（paraformer-realtime-*）只能走 WebSocket 实时端点（asr_start_streaming），
-        // 否则 DashScope 返回 HTTP 400 "url error"（模型名与端点不匹配）。
-        let model = if self.cred.model.is_empty() || qwen_is_streaming_model(&self.cred.model) {
-            Self::MODEL
-        } else {
-            self.cred.model.as_str()
-        };
+        let endpoint = self.cred.effective_http_endpoint();
+        let model = self.effective_batch_model();
+        // 同步端点未定义 language_hints 参数（文档的 parameters 只有
+        // format / sample_rate / vocabulary），保持不发送。
         let b64 = BASE64_STD.encode(&wav_bytes);
-        let body = json!({
+        let data_url = format!("data:audio/wav;base64,{b64}");
+        // 音频内容格式按模型分流：qwen-audio-3.x 系要求
+        // `{"type":"input_audio","input_audio":{"data":...}}`；历史 Fun-ASR-Realtime
+        // 走旧格式 `{"audio": ...}`。一刀切替换会让老配置从「能用」变成「未知错误」。
+        let legacy = qwen_uses_legacy_audio_content(model);
+        let audio_content = if legacy {
+            json!({ "audio": data_url })
+        } else {
+            json!({ "type": "input_audio", "input_audio": { "data": data_url } })
+        };
+        let mut body = json!({
             "model": model,
             "input": {
                 "messages": [{
                     "role": "user",
-                    "content": [{
-                        "audio": format!("data:audio/wav;base64,{b64}")
-                    }]
+                    "content": [audio_content]
                 }]
             },
             "parameters": {
                 "format": "wav",
                 "sample_rate": 16000
-            },
-            "resources": []
+            }
         });
+        if legacy {
+            // 旧协议实测带这个字段；新协议按官方示例不带
+            body["resources"] = json!([]);
+        }
+
+        // 即时热词：文档明确仅 qwen-audio-3.x 系支持，对 fun-asr-realtime /
+        // paraformer 系发这个参数很可能直接 400 —— 必须门控而非「有热词就发」。
+        let hotwords = self.cred.effective_hotwords(opts);
+        if !hotwords.is_empty() {
+            if qwen_supports_inline_vocabulary(model) {
+                body["parameters"]["vocabulary"] = hotwords_to_vocabulary_json(&hotwords);
+            } else {
+                warn!(
+                    "[ASR] 模型 {model} 不支持即时热词，已忽略 {} 条热词（如需热词请改用 qwen-audio-3.x 系）",
+                    hotwords.len()
+                );
+            }
+        }
 
         let resp = self
             .http
@@ -325,7 +501,7 @@ impl AsrProvider for QwenAsrProvider {
 
         Ok(AsrResult {
             text,
-            language: language_hint.map(str::to_string),
+            language: opts.language_hint.clone(),
             confidence: None,
             provider_id: Self::ID.into(),
         })
@@ -475,14 +651,13 @@ impl AsrProvider for LlamaAsrProvider {
         true
     }
 
-    #[instrument(skip(self, wav_bytes), fields(provider = Self::ID))]
+    #[instrument(skip(self, wav_bytes, opts), fields(provider = Self::ID))]
     async fn recognize(
         &self,
         wav_bytes: Vec<u8>,
-        language_hint: Option<&str>,
+        opts: &AsrOptions,
     ) -> Result<AsrResult, AsrError> {
         // llama-server 转写不支持语言提示（模型自动判语言），忽略。
-        let _ = language_hint;
         let endpoint = format!("{}/v1/audio/transcriptions", self.effective_endpoint());
 
         let mut form = reqwest::multipart::Form::new()
@@ -498,10 +673,15 @@ impl AsrProvider for LlamaAsrProvider {
                         message: format!("构造 multipart 失败: {e}"),
                     })?,
             );
-        // 热词接口：extra["hotwords"] 非空时作为 prompt 上下文偏置传入
+        // 热词接口：作为 prompt 上下文偏置传入
         //（偏置非强制——提升特定词命中概率，不保证一定识别为热词）
-        if !self.cred.hotwords.is_empty() {
-            form = form.text("prompt", self.cred.hotwords.join(", "));
+        let hotwords = self.cred.effective_hotwords(opts);
+        if let Some(prompt) = llama_prompt_from_hotwords(&hotwords) {
+            debug!(
+                "[ASR] llama-asr prompt 偏置（{} 字符）: {prompt}",
+                prompt.chars().count()
+            );
+            form = form.text("prompt", prompt);
         }
 
         let mut req = self.http.post(&endpoint).multipart(form);
@@ -541,22 +721,81 @@ impl AsrProvider for LlamaAsrProvider {
     }
     /// 结果流式识别：整段 WAV 上传 + SSE 增量 partial（`on_partial` 回调，
     /// 事件发射由调用方负责）→ final。复用整句的端点/模型/热词选择逻辑。
-    #[instrument(skip(self, wav_bytes, on_partial), fields(provider = Self::ID))]
+    #[instrument(skip(self, wav_bytes, opts, on_partial), fields(provider = Self::ID))]
     async fn stream_recognize(
         &self,
         wav_bytes: Vec<u8>,
+        opts: &AsrOptions,
         on_partial: Option<Arc<dyn for<'a> Fn(&'a str) + Send + Sync + 'static>>,
     ) -> Result<AsrResult, AsrError> {
+        let prompt = llama_prompt_from_hotwords(&self.cred.effective_hotwords(opts));
         super::provider_stream_llama::recognize_stream(
             &self.http,
             &self.cred,
             &self.effective_endpoint(),
             &self.effective_model(),
+            prompt,
             wav_bytes,
             on_partial,
         )
         .await
     }
+}
+
+/// llama-asr 偏置文本的总字符上限（含引导语）。
+///
+/// 约 224 token 的 prompt 有效窗口在中文下大致对应这个量级；保守取 200。
+const LLAMA_PROMPT_MAX_CHARS: usize = 200;
+
+/// 热词 → llama-server 的 `prompt` 偏置文本。
+///
+/// 形式：`热词：A、B、C。`——**不是**裸的逗号列表。Qwen3-ASR 的 prompt 偏置是
+/// 「前文上下文」，裸列表容易被当成待续的转录文本；带引导语更接近上游 HF
+/// 文档的推荐用法（`prompt="Vocabulary: ..."`），偏置目标更明确。
+///
+/// 两个上限（原实现直接 `join(", ")`，都没有）：
+/// - **去重**：同一角色可能重复配置，重复词只会挤占窗口
+/// - **总长 ≤ [`LLAMA_PROMPT_MAX_CHARS`]**：OpenAI 兼容 `prompt` 的有效窗口约
+///   224 token，超长会被服务端截断，甚至让模型把尾巴的语气当成待续文本而
+///   干扰解码。按 **字符**（非字节）截断，避免切断 UTF-8
+///
+/// ⚠️ **待验证**：`prompt` 是否真被 llama-server 的 `/v1/audio/transcriptions`
+/// 消费尚未证实（上游 llama.cpp 无文档确认；已知 vLLM / omlx 实现了该字段）。
+/// 若服务端忽略它，热词会**静默失效**——排查时先开 `llama-server --verbose`
+/// 看 prompt 是否出现在构造的消息里。
+fn llama_prompt_from_hotwords(hotwords: &[Hotword]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut words: Vec<&str> = Vec::new();
+    for h in hotwords {
+        let t = h.text.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if seen.insert(t) {
+            words.push(t);
+        }
+    }
+    if words.is_empty() {
+        return None;
+    }
+    let prefix = "热词：";
+    let suffix = "。";
+    let budget =
+        LLAMA_PROMPT_MAX_CHARS.saturating_sub(prefix.chars().count() + suffix.chars().count());
+    let mut body = String::new();
+    for w in words {
+        let sep = if body.is_empty() { "" } else { "、" };
+        let extra = sep.chars().count() + w.chars().count();
+        if body.chars().count() + extra > budget {
+            break;
+        }
+        body.push_str(sep);
+        body.push_str(w);
+    }
+    if body.is_empty() {
+        return None;
+    }
+    Some(format!("{prefix}{body}{suffix}"))
 }
 
 /// 解析 llama-server 转写响应文本。
@@ -658,20 +897,35 @@ pub fn list_provider_info() -> Vec<ProviderInfo> {
         ProviderInfo {
             id: QwenAsrProvider::ID,
             display_name: QwenAsrProvider::DISPLAY,
-            description: "阿里云 DashScope ASR（实时 / 非实时）",
-            default_endpoint: QwenAsrProvider::DEFAULT_ENDPOINT,
+            description: "阿里云百炼 ASR（实时 / 非实时）",
             supports_streaming: true,
             config_fields: qwen_asr_config_fields(),
+            regions: DashScopeRegion::ALL
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect(),
         },
         ProviderInfo {
             id: LlamaAsrProvider::ID,
             display_name: LlamaAsrProvider::DISPLAY,
             description: "本地 llama-server Qwen3-ASR（整句识别）",
-            default_endpoint: LlamaAsrProvider::DEFAULT_ENDPOINT,
             supports_streaming: false,
             config_fields: llama_asr_config_fields(),
+            // 本地服务无地域概念：空数组 → 前端不渲染地域下拉
+            regions: Vec::new(),
         },
     ]
+}
+
+/// 模型对应的端点类型（选中该模型时应把哪个端点字段切到该协议）。
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointKind {
+    /// 同步（非实时）端点 → `provider_configs[id].endpoint`。
+    Http,
+    /// 实时 WebSocket 端点 → `provider_configs[id].ws_endpoint`。
+    Ws,
 }
 
 /// 模型元数据（`asr_list_models` 返回给前端渲染下拉）。
@@ -686,41 +940,235 @@ pub struct ModelInfo {
     pub supports_streaming: bool,
     /// 是否默认模型（`provider_configs[id].model` 为空时生效）。
     pub is_default: bool,
-    /// 协议端点预设（选中该模型时同步填入 endpoint 配置；None = 无预设，
-    /// 用当前 endpoint 配置——llama-asr 的端点与模型无关）。
-    pub endpoint: Option<String>,
+    /// 端点预设：选中该模型时把对应端点字段填成**当前地域**的默认值。
+    /// `None` = 不干预端点（llama-asr 的端点与模型无关）。
+    ///
+    /// 只给类型不给完整 URL：端点是地域相关的，由前端从
+    /// [`ProviderInfo::regions`] 取当前地域的默认值，避免两处真相。
+    pub endpoint_kind: Option<EndpointKind>,
 }
 
-/// qwen（DashScope）语音识别模型静态清单。
+/// 单个 DashScope 模型的协议能力描述。
 ///
-/// 仅列协议已接入的模型：multimodal-generation 一次性返回（非流式）+
-/// WebSocket 实时（流式）。异步任务类（paraformer-v2/-8k）与
-/// OpenAI-compatible（qwen-audio-asr）协议未接入，不列出。
-pub fn qwen_models() -> Vec<ModelInfo> {
-    vec![
-        ModelInfo {
-            id: "fun-asr-realtime".into(),
-            display_name: "Fun-ASR-Realtime（非实时）".into(),
-            supports_streaming: false,
-            is_default: true,
-            endpoint: Some(QwenAsrProvider::DEFAULT_ENDPOINT.to_string()),
-        },
-        ModelInfo {
-            id: "paraformer-realtime-v2".into(),
-            display_name: "Paraformer-Realtime-V2".into(),
-            supports_streaming: true,
-            is_default: false,
-            endpoint: Some(super::provider_stream::WS_URL.to_string()),
-        },
-    ]
+/// 模型清单、流式判定、body 格式、热词门控、端点预设**全部从这张表派生**
+/// —— 单一真相，避免「加了模型忘了改 `matches!`」导致静默走错链路。
+struct QwenModelSpec {
+    id: &'static str,
+    display: &'static str,
+    /// 走 WebSocket 实时端点（`false` = 同步 HTTP 端点）。
+    ws_realtime: bool,
+    /// 支持即时热词 `parameters.vocabulary`（文档明确**仅 qwen-audio-3.x 系**）。
+    supports_inline_vocabulary: bool,
+    /// 支持预编译热词 `parameters.vocabulary_id`。
+    supports_vocabulary_id: bool,
+    /// 支持 `language_hints`。
+    supports_language_hints: bool,
+    /// 同步 body 是否沿用旧格式 `content:[{"audio": "data:..."}]`。
+    ///
+    /// 新的 qwen-audio-3.x 系要求 `content:[{"type":"input_audio","input_audio":{"data":...}}]`；
+    /// 历史 Fun-ASR-Realtime 走的是旧格式。一刀切替换会让老配置从「能用」变成
+    /// 「未知错误」，故按模型分流。
+    use_legacy_audio_content: bool,
+    /// 该模型可用的地域。
+    regions: &'static [DashScopeRegion],
+    /// 所属地域是否以它作为**同步**默认模型。
+    is_default_batch: bool,
+    /// 前端 `find(supports_streaming)` 挑流式模型时的**首选**。
+    is_default_stream: bool,
 }
 
-/// qwen 流式模型集合（与 [`qwen_models`] 保持同步）。
+const BOTH_REGIONS: &[DashScopeRegion] =
+    &[DashScopeRegion::CnBeijing, DashScopeRegion::ApSoutheast1];
+const CN_ONLY: &[DashScopeRegion] = &[DashScopeRegion::CnBeijing];
+
+/// DashScope 语音识别模型清单（按协议实接情况维护）。
 ///
-/// 流式模型只能走 WebSocket 实时端点；非流式端点（multimodal-generation）
-/// 不认识它们，DashScope 会返回 HTTP 400 "url error"（模型名与端点不匹配）。
+/// 异步任务类（`*-filetrans`、`paraformer-v2`）协议未接入，不列出。
+const QWEN_MODELS: &[QwenModelSpec] = &[
+    QwenModelSpec {
+        id: "qwen-audio-3.0-asr-flash",
+        display: "Qwen-Audio-3.0-ASR-Flash（非实时）",
+        ws_realtime: false,
+        supports_inline_vocabulary: true,
+        supports_vocabulary_id: true,
+        supports_language_hints: true,
+        use_legacy_audio_content: false,
+        regions: BOTH_REGIONS,
+        is_default_batch: true,
+        is_default_stream: false,
+    },
+    // 历史默认非流式模型。DashScope 已把它归入实时（WebSocket）族，但本项目的
+    // 同步路径一直在用它且实测可用，故按旧格式保留在清单里，避免老配置失效
+    // —— 不再作为默认（见 is_default_batch: false）。
+    QwenModelSpec {
+        id: "fun-asr-realtime",
+        display: "Fun-ASR-Realtime（非实时·历史协议）",
+        ws_realtime: false,
+        supports_inline_vocabulary: false,
+        supports_vocabulary_id: true,
+        supports_language_hints: false,
+        use_legacy_audio_content: true,
+        regions: BOTH_REGIONS,
+        is_default_batch: false,
+        is_default_stream: false,
+    },
+    // 流式首选仍是它：现有 WS 客户端是对着这个模型实证写出来的，
+    // fun-asr-realtime-2026-02-28 是否复用同一协议尚未实测（见计划 V2）。
+    QwenModelSpec {
+        id: "paraformer-realtime-v2",
+        display: "Paraformer-Realtime-V2",
+        ws_realtime: true,
+        supports_inline_vocabulary: false,
+        supports_vocabulary_id: true,
+        supports_language_hints: true,
+        use_legacy_audio_content: false,
+        regions: BOTH_REGIONS,
+        is_default_batch: false,
+        is_default_stream: true,
+    },
+    // 文档的热词支持表只在北京地域列出它（新加坡只列 fun-asr-realtime 与
+    // fun-asr-realtime-2025-11-07），故保守标为北京独有。
+    QwenModelSpec {
+        id: "fun-asr-realtime-2026-02-28",
+        display: "Fun-ASR-Realtime（2026-02-28）",
+        ws_realtime: true,
+        supports_inline_vocabulary: false,
+        supports_vocabulary_id: true,
+        supports_language_hints: true,
+        use_legacy_audio_content: false,
+        regions: CN_ONLY,
+        is_default_batch: false,
+        is_default_stream: false,
+    },
+];
+
+/// 按 id 查模型规格。未知模型返回 `None`。
+fn qwen_model_spec(model: &str) -> Option<&'static QwenModelSpec> {
+    QWEN_MODELS.iter().find(|s| s.id == model)
+}
+
+/// qwen（DashScope）语音识别模型清单，按地域过滤。
+pub fn qwen_models(region: DashScopeRegion) -> Vec<ModelInfo> {
+    QWEN_MODELS
+        .iter()
+        .filter(|s| s.regions.contains(&region))
+        .map(|s| ModelInfo {
+            id: s.id.to_string(),
+            display_name: s.display.to_string(),
+            supports_streaming: s.ws_realtime,
+            is_default: s.is_default_batch,
+            endpoint_kind: Some(if s.ws_realtime {
+                EndpointKind::Ws
+            } else {
+                EndpointKind::Http
+            }),
+        })
+        .collect()
+}
+
+/// 该模型是否走 WebSocket 实时端点。
+///
+/// 流式模型只能走 WebSocket；非流式端点（multimodal-generation）不认识它们，
+/// DashScope 会返回 HTTP 400 "url error"（模型名与端点不匹配）。
 pub fn qwen_is_streaming_model(model: &str) -> bool {
-    matches!(model, "paraformer-realtime-v2")
+    qwen_model_spec(model).is_some_and(|s| s.ws_realtime)
+}
+
+/// 该模型是否支持即时热词 `parameters.vocabulary`。
+///
+/// 文档明确仅 qwen-audio-3.x 系支持；对 fun-asr-realtime / paraformer 系发这个
+/// 参数很可能直接 400，所以必须门控而不是「有热词就发」。
+pub fn qwen_supports_inline_vocabulary(model: &str) -> bool {
+    qwen_model_spec(model).is_some_and(|s| s.supports_inline_vocabulary)
+}
+
+/// 该模型是否支持预编译热词 `parameters.vocabulary_id`。
+pub fn qwen_supports_vocabulary_id(model: &str) -> bool {
+    qwen_model_spec(model).is_some_and(|s| s.supports_vocabulary_id)
+}
+
+/// 该模型是否支持 `language_hints`。
+pub fn qwen_supports_language_hints(model: &str) -> bool {
+    qwen_model_spec(model).is_some_and(|s| s.supports_language_hints)
+}
+
+/// 该模型的同步 body 是否用旧格式（`{"audio": ...}` 而非 `input_audio`）。
+fn qwen_uses_legacy_audio_content(model: &str) -> bool {
+    qwen_model_spec(model).is_some_and(|s| s.use_legacy_audio_content)
+}
+
+/// 给定地域下该走哪种协议的默认模型。
+///
+/// `ws = true` 取流式首选，`false` 取同步默认。地域内无对应模型时回退到
+/// 清单里第一个同协议模型；清单为空（不可能）时回退第一个模型。
+///
+/// 取代了两处硬编码回退：`QwenAsrProvider::MODEL` 常量与
+/// `asr_start_streaming` 里的 `"paraformer-realtime-v2"` 字面量。
+pub fn qwen_default_model(ws: bool, region: DashScopeRegion) -> &'static str {
+    let avail = |s: &QwenModelSpec| s.regions.contains(&region) && s.ws_realtime == ws;
+    QWEN_MODELS
+        .iter()
+        .find(|s| {
+            avail(s)
+                && if ws {
+                    s.is_default_stream
+                } else {
+                    s.is_default_batch
+                }
+        })
+        .or_else(|| QWEN_MODELS.iter().find(|s| avail(s)))
+        .or_else(|| QWEN_MODELS.first())
+        .map(|s| s.id)
+        .unwrap_or("qwen-audio-3.0-asr-flash")
+}
+
+/// 按模型能力构造 WS run-task 的可选参数。
+///
+/// **热词门控集中在这里**：模型不支持某种热词机制时**不发**该字段，而不是
+/// 「有热词就发」—— 对不支持的模型发 `parameters.vocabulary` 很可能直接 400。
+/// 静默丢弃会让用户困惑，所以同时 warn 一条说明原因。
+pub fn build_stream_params(
+    model: &str,
+    cred: &ProviderCredentials,
+    opts: &AsrOptions,
+) -> super::provider_stream::StreamParams {
+    let hotwords = cred.effective_hotwords(opts);
+    let vocabulary = if hotwords.is_empty() {
+        None
+    } else if qwen_supports_inline_vocabulary(model) {
+        Some(hotwords_to_vocabulary_json(&hotwords))
+    } else {
+        warn!(
+            "[ASR] 流式模型 {model} 不支持即时热词，已忽略 {} 条热词\
+             （该模型族只支持预编译热词表 vocabulary_id）",
+            hotwords.len()
+        );
+        None
+    };
+
+    if !cred.vocabulary_id.trim().is_empty() && !qwen_supports_vocabulary_id(model) {
+        warn!(
+            "[ASR] 模型 {model} 不支持预编译热词表，已忽略 vocabulary_id={}",
+            cred.vocabulary_id.trim()
+        );
+    }
+    let vocabulary_id = if qwen_supports_vocabulary_id(model) {
+        Some(cred.vocabulary_id.trim().to_string()).filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
+    super::provider_stream::StreamParams {
+        // 文档：qwen-audio-3.x 最多 4 个、fun-asr-realtime 系只取第一个。
+        // 这里只做能力门控，个数由服务端按各自规则处理
+        language_hint: if qwen_supports_language_hints(model) {
+            opts.language_hint.clone()
+        } else {
+            None
+        },
+        vocabulary,
+        vocabulary_id,
+    }
 }
 
 /// 按 provider id 返回模型清单。
@@ -735,9 +1183,28 @@ pub async fn list_models(
     http: &reqwest::Client,
 ) -> Result<Vec<ModelInfo>, AsrError> {
     match provider_id {
-        QwenAsrProvider::ID => Ok(qwen_models()),
+        QwenAsrProvider::ID => Ok(qwen_models(qwen_region(app))),
         LlamaAsrProvider::ID => llama_models(app, http).await,
         _ => Ok(Vec::new()),
+    }
+}
+
+/// 读 qwen provider 当前配置的地域（模型清单按地域过滤）。
+///
+/// 读设置失败时回退默认地域而非报错：模型下拉拉不出来是可用性问题，
+/// 不该让整个设置页变成一个错误弹窗。
+fn qwen_region(app: &tauri::AppHandle) -> DashScopeRegion {
+    match super::settings::load(app) {
+        Ok(s) => DashScopeRegion::parse(
+            &s.provider_configs
+                .get(QwenAsrProvider::ID)
+                .map(|c| c.region.clone())
+                .unwrap_or_default(),
+        ),
+        Err(e) => {
+            warn!("[ASR] 读取地域配置失败，回退默认地域: {e}");
+            DashScopeRegion::DEFAULT
+        },
     }
 }
 
@@ -788,7 +1255,8 @@ async fn llama_models(
             // 语义不同，但前端流式开关可用（录音结束出 partial 而非边录边出）
             supports_streaming: true,
             is_default: i == 0,
-            endpoint: None,
+            // 端点与模型无关（本地服务地址固定）
+            endpoint_kind: None,
             id,
         })
         .collect())
@@ -817,8 +1285,32 @@ pub async fn get_provider(
 // 静态字段（让 trait 方法与 list_provider_info 共用一份数据）
 // ============================================================================
 
+/// 地域下拉的选项（由 [`super::region::DashScopeRegion::ALL`] 投影而来）。
+fn region_field_options() -> Vec<AsrConfigFieldOption> {
+    DashScopeRegion::ALL
+        .iter()
+        .map(|r| AsrConfigFieldOption {
+            value: r.id(),
+            label: r.label(),
+        })
+        .collect()
+}
+
 fn qwen_asr_config_fields() -> Vec<AsrConfigField> {
     vec![
+        AsrConfigField {
+            key: "region",
+            label: "地域",
+            kind: ConfigFieldKind::Select,
+            required: true,
+            default_value: Some(DashScopeRegion::DEFAULT.id()),
+            placeholder: None,
+            hint: Some(
+                "华北2（北京）与新加坡的域名、API Key、模型列表互相独立，不能混用；\
+                 切换后请填对应地域的 API Key",
+            ),
+            options: region_field_options(),
+        },
         AsrConfigField {
             key: "api_key",
             label: "DashScope API Key",
@@ -826,16 +1318,62 @@ fn qwen_asr_config_fields() -> Vec<AsrConfigField> {
             required: true,
             default_value: None,
             placeholder: Some("sk-..."),
-            hint: Some("阿里云百炼 / DashScope 平台 Key"),
+            hint: Some("阿里云百炼（Model Studio）平台 Key，须与所选地域一致"),
+            options: Vec::new(),
         },
         AsrConfigField {
             key: "endpoint",
-            label: "Endpoint",
+            label: "非实时端点",
             kind: ConfigFieldKind::Text,
             required: false,
-            default_value: Some(QwenAsrProvider::DEFAULT_ENDPOINT),
-            placeholder: Some("非实时 Fun-ASR-Realtime 端点"),
-            hint: Some("默认 DashScope multimodal-generation；填自建代理时整段替换"),
+            // 默认值随地域变化，是派生值而非静态串 —— 由 ProviderInfo.regions
+            // 下发、前端在切地域时填入（见 SettingsAsr.vue 的地域 watch）。
+            default_value: None,
+            placeholder: Some("留空使用所选地域的默认地址"),
+            hint: Some(
+                "multimodal-generation 端点。填业务空间专属域名可覆盖，形如 \
+                 https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+            ),
+            options: Vec::new(),
+        },
+        AsrConfigField {
+            key: "ws_endpoint",
+            label: "实时（流式）端点",
+            kind: ConfigFieldKind::Text,
+            required: false,
+            default_value: None,
+            placeholder: Some("留空使用所选地域的默认地址"),
+            hint: Some(
+                "WebSocket 端点，仅流式模型使用。形如 \
+                 wss://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/inference",
+            ),
+            options: Vec::new(),
+        },
+        AsrConfigField {
+            key: "vocabulary_id",
+            label: "热词表 ID（预编译热词）",
+            kind: ConfigFieldKind::Text,
+            required: false,
+            default_value: None,
+            placeholder: Some("vocab-xxxxxxxx"),
+            hint: Some(
+                "仅 fun-asr-realtime / paraformer-realtime 系生效（qwen-audio-3.x 系用不上的话请填下方热词）。\
+                 需在百炼控制台预先创建，且建表时的 target_model 必须与识别模型一致，否则热词静默不生效",
+            ),
+            options: Vec::new(),
+        },
+        AsrConfigField {
+            key: "hotwords",
+            label: "热词（可选）",
+            kind: ConfigFieldKind::Text,
+            required: false,
+            default_value: None,
+            placeholder: Some("量子计算, Anthropic:5, 厄洛替尼"),
+            hint: Some(
+                "逗号/分号/空白分隔；可选权重「词:权重」（1-5，或 50 为超级热词），缺省 4。\
+                 仅 qwen-audio-3.x 系支持即时热词；fun-asr-realtime / paraformer 系请改用上方的热词表 ID",
+            ),
+            options: Vec::new(),
         },
     ]
 }
@@ -850,6 +1388,7 @@ fn llama_asr_config_fields() -> Vec<AsrConfigField> {
             default_value: Some(LlamaAsrProvider::DEFAULT_ENDPOINT),
             placeholder: Some("http://127.0.0.1:8080"),
             hint: Some("llama-server 地址（Qwen3-ASR 本地部署）；局域网部署改 http://<IP>:8080"),
+            options: Vec::new(),
         },
         AsrConfigField {
             key: "model",
@@ -859,6 +1398,7 @@ fn llama_asr_config_fields() -> Vec<AsrConfigField> {
             default_value: Some(LlamaAsrProvider::DEFAULT_MODEL),
             placeholder: Some("models/Qwen3-ASR-1.7B-Q8_0.gguf"),
             hint: Some("从上方模型列表选择，或用 /v1/models 查询服务端全名"),
+            options: Vec::new(),
         },
         AsrConfigField {
             key: "api_key",
@@ -868,6 +1408,21 @@ fn llama_asr_config_fields() -> Vec<AsrConfigField> {
             default_value: None,
             placeholder: Some("本地服务无需填写"),
             hint: Some("llama-server 带 --api-key 部署时填写，否则留空"),
+            options: Vec::new(),
+        },
+        AsrConfigField {
+            key: "hotwords",
+            label: "热词（可选）",
+            kind: ConfigFieldKind::Text,
+            required: false,
+            default_value: None,
+            placeholder: Some("量子计算, Anthropic, 厄洛替尼"),
+            hint: Some(
+                "逗号/分号/空白分隔，作为 prompt 偏置提升专名命中率。\
+                 总长超 200 字符会截断。注意：本地服务是否消费 prompt 尚未验证，\
+                 若无效可开 llama-server --verbose 核对",
+            ),
+            options: Vec::new(),
         },
     ]
 }
@@ -909,8 +1464,7 @@ mod tests {
         let c = ProviderCredentials {
             api_key: "k".into(),
             endpoint: "http://x.example.com/".into(),
-            model: String::new(),
-            hotwords: Vec::new(),
+            ..Default::default()
         };
         assert_eq!(c.normalized_endpoint(), "http://x.example.com");
         assert!(c.has_api_key());
@@ -920,9 +1474,7 @@ mod tests {
     fn provider_credentials_whitespace_api_key_is_empty() {
         let c = ProviderCredentials {
             api_key: "   ".into(),
-            endpoint: "".into(),
-            model: String::new(),
-            hotwords: Vec::new(),
+            ..Default::default()
         };
         assert!(!c.has_api_key());
     }
@@ -933,6 +1485,313 @@ mod tests {
         assert_eq!(info.len(), 2);
         assert!(info.iter().any(|p| p.id == "qwen-asr"));
         assert!(info.iter().any(|p| p.id == "llama-asr"));
+    }
+
+    // ── 地域与模型表 ────────────────────────────────────────────────
+
+    #[test]
+    fn only_qwen_declares_regions() {
+        let info = list_provider_info();
+        let qwen = info.iter().find(|p| p.id == "qwen-asr").unwrap();
+        let llama = info.iter().find(|p| p.id == "llama-asr").unwrap();
+        assert_eq!(qwen.regions.len(), DashScopeRegion::ALL.len());
+        // 本地服务无地域概念 → 空数组，前端据此不渲染下拉
+        assert!(llama.regions.is_empty());
+    }
+
+    #[test]
+    fn region_config_field_matches_region_table() {
+        let fields = qwen_asr_config_fields();
+        let region = fields.iter().find(|f| f.key == "region").unwrap();
+        assert_eq!(region.kind, ConfigFieldKind::Select);
+        let ids: Vec<_> = region.options.iter().map(|o| o.value).collect();
+        let expected: Vec<_> = DashScopeRegion::ALL.iter().map(|r| r.id()).collect();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn every_config_field_key_exists_on_provider_config() {
+        // 回归防线：设置页把 config_field.key 写成 ProviderConfig 的顶层键，
+        // 而 ProviderConfig 没有 deny_unknown_fields —— 漏加字段会被 serde
+        // 静默丢弃（用户填了不生效、刷新即失）。这里用序列化往返兜底。
+        for fields in [qwen_asr_config_fields(), llama_asr_config_fields()] {
+            for f in fields {
+                let cfg = crate::ai_service::asr::settings::ProviderConfig::default();
+                let value = serde_json::to_value(&cfg).expect("ProviderConfig 可序列化");
+                let obj = value.as_object().expect("是对象");
+                assert!(
+                    obj.contains_key(f.key),
+                    "config_field '{}' 在 ProviderConfig 上不存在——会被静默丢弃",
+                    f.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_spec_table_is_self_consistent() {
+        for s in QWEN_MODELS {
+            assert!(!s.regions.is_empty(), "{} 没有可用地域", s.id);
+            if s.ws_realtime {
+                // 流式模型只能走 WebSocket 端点
+                assert!(
+                    !s.use_legacy_audio_content,
+                    "{} 是流式模型，不该有同步 body 格式选项",
+                    s.id
+                );
+            }
+            // 即时热词是 qwen-audio-3.x 系专属能力
+            if s.supports_inline_vocabulary {
+                assert!(
+                    s.id.starts_with("qwen-audio-3"),
+                    "{} 声明了即时热词，但文档仅 qwen-audio-3.x 系支持",
+                    s.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_region_has_a_default_batch_and_stream_model() {
+        for r in DashScopeRegion::ALL.iter().copied() {
+            let models = qwen_models(r);
+            assert!(!models.is_empty(), "地域 {} 没有模型", r.id());
+            assert_eq!(
+                models.iter().filter(|m| m.is_default).count(),
+                1,
+                "地域 {} 的同步默认模型不唯一",
+                r.id()
+            );
+            let default = qwen_default_model(false, r);
+            assert!(models.iter().any(|m| m.id == default));
+            assert!(!qwen_is_streaming_model(default));
+            // 流式默认模型也必须在清单里
+            let stream = qwen_default_model(true, r);
+            assert!(models.iter().any(|m| m.id == stream));
+            assert!(qwen_is_streaming_model(stream));
+        }
+    }
+
+    #[test]
+    fn streaming_models_are_flagged_by_the_table() {
+        // 取代原来写死的 matches!(model, "paraformer-realtime-v2")
+        assert!(qwen_is_streaming_model("paraformer-realtime-v2"));
+        assert!(qwen_is_streaming_model("fun-asr-realtime-2026-02-28"));
+        assert!(!qwen_is_streaming_model("qwen-audio-3.0-asr-flash"));
+        assert!(!qwen_is_streaming_model("fun-asr-realtime"));
+        assert!(!qwen_is_streaming_model("不存在的模型"));
+    }
+
+    #[test]
+    fn singapore_region_excludes_cn_only_models() {
+        let cn: Vec<_> = qwen_models(DashScopeRegion::CnBeijing)
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        let sg: Vec<_> = qwen_models(DashScopeRegion::ApSoutheast1)
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        // 文档的热词支持表只在北京列出 fun-asr-realtime-2026-02-28
+        assert!(cn.contains(&"fun-asr-realtime-2026-02-28".to_string()));
+        assert!(!sg.contains(&"fun-asr-realtime-2026-02-28".to_string()));
+        // 新接入的同步模型两地都可用
+        assert!(sg.contains(&"qwen-audio-3.0-asr-flash".to_string()));
+    }
+
+    #[test]
+    fn inline_vocabulary_is_gated_to_qwen_audio_3x() {
+        assert!(qwen_supports_inline_vocabulary("qwen-audio-3.0-asr-flash"));
+        // 文档明确 fun-asr-realtime / paraformer 系不支持即时热词
+        assert!(!qwen_supports_inline_vocabulary(
+            "fun-asr-realtime-2026-02-28"
+        ));
+        assert!(!qwen_supports_inline_vocabulary("paraformer-realtime-v2"));
+        assert!(qwen_supports_vocabulary_id("paraformer-realtime-v2"));
+    }
+
+    // ── 端点派生 ────────────────────────────────────────────────────
+
+    #[test]
+    fn effective_endpoints_fall_back_by_region() {
+        let sg = ProviderCredentials {
+            region: "ap-southeast-1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            sg.effective_http_endpoint(),
+            DashScopeRegion::ApSoutheast1.http_endpoint()
+        );
+        assert_eq!(
+            sg.effective_ws_endpoint(),
+            DashScopeRegion::ApSoutheast1.ws_endpoint()
+        );
+
+        let unknown = ProviderCredentials {
+            region: "火星".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            unknown.effective_http_endpoint(),
+            DashScopeRegion::DEFAULT.http_endpoint()
+        );
+    }
+
+    #[test]
+    fn effective_endpoints_keep_explicit_config() {
+        let c = ProviderCredentials {
+            endpoint: "https://llm-x.cn-beijing.maas.aliyuncs.com/api/v1/x".into(),
+            ws_endpoint: "wss://llm-x.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference".into(),
+            region: "ap-southeast-1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.effective_http_endpoint(),
+            "https://llm-x.cn-beijing.maas.aliyuncs.com/api/v1/x"
+        );
+        assert_eq!(
+            c.effective_ws_endpoint(),
+            "wss://llm-x.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"
+        );
+    }
+
+    #[test]
+    fn http_endpoint_rejects_a_ws_address() {
+        // 老数据的坑：唯一的 endpoint 被模型预设写成了 wss://
+        let c = ProviderCredentials {
+            endpoint: "wss://dashscope.aliyuncs.com/api-ws/v1/inference".into(),
+            region: "ap-southeast-1".into(),
+            ..Default::default()
+        };
+        // 拿去发 HTTP 会 builder error，必须回退该地域的同步端点
+        assert_eq!(
+            c.effective_http_endpoint(),
+            DashScopeRegion::ApSoutheast1.http_endpoint()
+        );
+    }
+
+    // ── 热词 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn call_level_hotwords_override_config_level() {
+        let cred = ProviderCredentials {
+            hotwords: vec![Hotword::new("配置级")],
+            ..Default::default()
+        };
+        // 空 → 回退配置级
+        assert_eq!(
+            cred.effective_hotwords(&AsrOptions::default())[0].text,
+            "配置级"
+        );
+        // 非空 → 覆盖
+        let opts = AsrOptions {
+            language_hint: None,
+            hotwords: vec![Hotword::new("调用级")],
+        };
+        assert_eq!(cred.effective_hotwords(&opts)[0].text, "调用级");
+    }
+
+    #[test]
+    fn hotword_weights_are_clamped() {
+        assert_eq!(Hotword::with_weight("词", 0).weight, 1);
+        assert_eq!(Hotword::with_weight("词", 255).weight, Hotword::MAX_WEIGHT);
+        assert_eq!(Hotword::new("词").weight, Hotword::DEFAULT_WEIGHT);
+    }
+
+    #[test]
+    fn hotword_from_text_list_drops_blanks() {
+        let list = Hotword::from_text_list(["张三", "  ", "", "李四"]);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].text, "张三");
+        assert_eq!(list[0].weight, Hotword::DEFAULT_WEIGHT);
+    }
+
+    #[test]
+    fn vocabulary_json_uses_weight_and_dedups() {
+        let v = hotwords_to_vocabulary_json(&[
+            Hotword::with_weight("张三", 5),
+            Hotword::with_weight("李四", 50),
+            Hotword::new("   "),             // 空白词条丢弃
+            Hotword::with_weight("张三", 1), // 重复 → 保留先出现的
+        ]);
+        assert_eq!(v["张三"], 5);
+        assert_eq!(v["李四"], 50);
+        assert_eq!(v.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn stream_params_gate_hotwords_by_model() {
+        // paraformer 系：不发即时热词，发 vocabulary_id
+        let cred = ProviderCredentials {
+            hotwords: vec![Hotword::new("张三")],
+            vocabulary_id: "vocab-abc".into(),
+            ..Default::default()
+        };
+        let opts = AsrOptions {
+            language_hint: Some("zh".into()),
+            hotwords: Vec::new(),
+        };
+        let p = build_stream_params("paraformer-realtime-v2", &cred, &opts);
+        assert!(p.vocabulary.is_none(), "paraformer 不支持即时热词，不该发");
+        assert_eq!(p.vocabulary_id.as_deref(), Some("vocab-abc"));
+        assert_eq!(p.language_hint.as_deref(), Some("zh"));
+
+        // 不支持的模型上配了 vocabulary_id → 忽略（避免 400）
+        let p2 = build_stream_params("不存在的模型", &cred, &opts);
+        assert!(p2.vocabulary_id.is_none());
+        assert!(p2.language_hint.is_none());
+    }
+
+    #[test]
+    fn stream_params_omit_empty_hotwords_and_vocabulary_id() {
+        let cred = ProviderCredentials::default();
+        let p = build_stream_params("paraformer-realtime-v2", &cred, &AsrOptions::default());
+        assert!(p.vocabulary.is_none());
+        assert!(p.vocabulary_id.is_none());
+        assert!(p.language_hint.is_none());
+    }
+
+    // ── llama 偏置文本 ──────────────────────────────────────────────
+
+    #[test]
+    fn llama_prompt_is_none_without_hotwords() {
+        assert!(llama_prompt_from_hotwords(&[]).is_none());
+        // 全是空白词条 → 等同没有
+        assert!(llama_prompt_from_hotwords(&[Hotword::new("  ")]).is_none());
+    }
+
+    #[test]
+    fn llama_prompt_is_not_a_bare_comma_list() {
+        let p = llama_prompt_from_hotwords(&[Hotword::new("张三"), Hotword::new("李四")]).unwrap();
+        // 带引导语的自然语言形式，而非裸 "A, B"
+        assert!(p.starts_with("热词："));
+        assert!(p.contains("张三、李四"));
+        assert!(p.ends_with("。"));
+    }
+
+    #[test]
+    fn llama_prompt_dedups_and_caps_length() {
+        let dup = llama_prompt_from_hotwords(&[
+            Hotword::new("张三"),
+            Hotword::new("张三"),
+            Hotword::new("李四"),
+        ])
+        .unwrap();
+        assert_eq!(dup.matches("张三").count(), 1);
+
+        // 超长输入被截断到上限内（按字符，不切断 UTF-8）
+        let many: Vec<Hotword> = (0..200).map(|i| Hotword::new(format!("词{i}"))).collect();
+        let long = llama_prompt_from_hotwords(&many).unwrap();
+        assert!(long.chars().count() <= LLAMA_PROMPT_MAX_CHARS);
+        assert!(long.starts_with("热词："));
+    }
+
+    #[test]
+    fn llama_prompt_ignores_weights() {
+        // llama 协议无权重概念：权重不同不应改变输出
+        let a = llama_prompt_from_hotwords(&[Hotword::with_weight("张三", 1)]).unwrap();
+        let b = llama_prompt_from_hotwords(&[Hotword::with_weight("张三", 50)]).unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]
