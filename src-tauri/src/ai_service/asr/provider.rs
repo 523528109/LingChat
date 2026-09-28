@@ -36,7 +36,6 @@
 //!     partial"，必须同链路，新增第三个 SSE 类 provider 时同步扩展该判定
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -869,21 +868,6 @@ fn map_reqwest_error(e: reqwest::Error) -> AsrError {
             message: format!("{e}"),
         }
     }
-}
-
-/// 构造一个 30s 超时的默认 reqwest Client（TLS 走统一的 webpki-roots 配置，
-/// Android 上 rustls-platform-verifier 未初始化会 panic，见 utils/tls.rs）。
-///
-/// 仅供测试 / 内部默认；生产环境调用方应通过 `factory::build_http_client`
-/// 注入正确的 TLS 配置。
-#[allow(dead_code)]
-pub fn default_http_client() -> reqwest::Client {
-    let tls = crate::utils::tls::build_tls_config().expect("构建默认 TLS 配置失败");
-    reqwest::Client::builder()
-        .tls_backend_preconfigured(tls)
-        .timeout(Duration::from_secs(30))
-        .build()
-        .expect("构建默认 HTTP 客户端失败")
 }
 
 // ============================================================================
@@ -1926,7 +1910,7 @@ mod tests {
     fn llama_effective_endpoint_falls_back_when_empty() {
         // 空 endpoint → 默认 127.0.0.1:8080（否则拼出相对 URL，reqwest builder error）
         let p = LlamaAsrProvider::new(
-            default_http_client(),
+            reqwest::Client::new(),
             ProviderCredentials {
                 endpoint: String::new(),
                 ..Default::default()
@@ -1939,7 +1923,7 @@ mod tests {
     fn llama_effective_endpoint_rejects_non_http_scheme() {
         // 缺 http:// 前缀（手填 127.0.0.1:8080）→ 回退默认
         let p = LlamaAsrProvider::new(
-            default_http_client(),
+            reqwest::Client::new(),
             ProviderCredentials {
                 endpoint: "127.0.0.1:8080".into(),
                 ..Default::default()
@@ -1951,7 +1935,7 @@ mod tests {
     #[test]
     fn llama_effective_endpoint_keeps_valid_url_and_trims_slash() {
         let p = LlamaAsrProvider::new(
-            default_http_client(),
+            reqwest::Client::new(),
             ProviderCredentials {
                 endpoint: "http://192.168.1.5:9000/".into(),
                 ..Default::default()
