@@ -1371,8 +1371,8 @@ export default {
     streamModeHintLocal: "录音结束后上传本地识别，结果逐步显示（llama-server 结果流式）",
     streamNotSupported: "当前模型不支持流式识别",
     provider: {
-      title: "识别服务商",
-      providerSelect: "服务商",
+      title: "识别服务",
+      providerSelect: "识别服务",
       modelRefresh: "刷新模型列表",
       modelListFailed: "获取模型列表失败：{err}",
       test: "测试连接",

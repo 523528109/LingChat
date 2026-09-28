@@ -1375,8 +1375,8 @@ export default {
       "Uploads the recording after you finish speaking, then shows results progressively (llama-server result streaming)",
     streamNotSupported: "The selected model does not support streaming recognition",
     provider: {
-      title: "Speech Recognition Provider",
-      providerSelect: "Provider",
+      title: "Speech Recognition",
+      providerSelect: "Service",
       modelRefresh: "Refresh model list",
       modelListFailed: "Failed to load model list: {err}",
       test: "Test connection",

@@ -955,6 +955,11 @@ pub struct ModelInfo {
 struct QwenModelSpec {
     id: &'static str,
     display: &'static str,
+    /// 是否出现在设置页的模型列表里。
+    ///
+    /// `false` = 隐藏的历史模型：不出现在清单里，但 [`qwen_model_spec`] 仍能查到它，
+    /// 因此老配置（`model: "fun-asr-realtime"`）的协议行为完全不变。
+    listed: bool,
     /// 走 WebSocket 实时端点（`false` = 同步 HTTP 端点）。
     ws_realtime: bool,
     /// 支持即时热词 `parameters.vocabulary`（文档明确**仅 qwen-audio-3.x 系**）。
@@ -988,6 +993,7 @@ const QWEN_MODELS: &[QwenModelSpec] = &[
     QwenModelSpec {
         id: "qwen-audio-3.0-asr-flash",
         display: "Qwen-Audio-3.0-ASR-Flash（非实时）",
+        listed: true,
         ws_realtime: false,
         supports_inline_vocabulary: true,
         supports_vocabulary_id: true,
@@ -997,12 +1003,29 @@ const QWEN_MODELS: &[QwenModelSpec] = &[
         is_default_batch: true,
         is_default_stream: false,
     },
+    QwenModelSpec {
+        id: "qwen-audio-3.1-asr-flash",
+        display: "Qwen-Audio-3.1-ASR-Flash（非实时）",
+        listed: true,
+        ws_realtime: false,
+        supports_inline_vocabulary: true,
+        supports_vocabulary_id: true,
+        supports_language_hints: true,
+        use_legacy_audio_content: false,
+        regions: BOTH_REGIONS,
+        // 保留 3.0 作默认：新增模型不改既有用户的行为。想改用 3.1 作默认为改此行
+        is_default_batch: false,
+        is_default_stream: false,
+    },
     // 历史默认非流式模型。DashScope 已把它归入实时（WebSocket）族，但本项目的
-    // 同步路径一直在用它且实测可用，故按旧格式保留在清单里，避免老配置失效
-    // —— 不再作为默认（见 is_default_batch: false）。
+    // 同步路径一直在用它且实测可用，故按旧格式保留规格，避免老配置失效。
+    // **不在设置页列出**（listed: false）——它与 fun-asr-realtime-2026-02-28 同名
+    // 不同协议，摆在列表里会让用户对着两个"Fun-ASR-Realtime"发懵；但老配置里
+    // 存着它的 model 名，规格必须仍能查到，否则会静默换 body 格式。
     QwenModelSpec {
         id: "fun-asr-realtime",
         display: "Fun-ASR-Realtime（非实时·历史协议）",
+        listed: false,
         ws_realtime: false,
         supports_inline_vocabulary: false,
         supports_vocabulary_id: true,
@@ -1017,6 +1040,7 @@ const QWEN_MODELS: &[QwenModelSpec] = &[
     QwenModelSpec {
         id: "paraformer-realtime-v2",
         display: "Paraformer-Realtime-V2",
+        listed: true,
         ws_realtime: true,
         supports_inline_vocabulary: false,
         supports_vocabulary_id: true,
@@ -1031,12 +1055,30 @@ const QWEN_MODELS: &[QwenModelSpec] = &[
     QwenModelSpec {
         id: "fun-asr-realtime-2026-02-28",
         display: "Fun-ASR-Realtime（2026-02-28）",
+        listed: true,
         ws_realtime: true,
         supports_inline_vocabulary: false,
         supports_vocabulary_id: true,
         supports_language_hints: true,
         use_legacy_audio_content: false,
         regions: CN_ONLY,
+        is_default_batch: false,
+        is_default_stream: false,
+    },
+    // 文档里实时识别的首推模型。与 fun-asr-realtime 共用同一个 WebSocket 接入
+    // 协议（同一份接入文档），因此不需要新的客户端代码——但它和
+    // fun-asr-realtime-2026-02-28 一样，**是否与现有客户端完全兼容尚未实测**
+    // （现有客户端是对着 paraformer-realtime-v2 实证写的）。
+    QwenModelSpec {
+        id: "qwen-audio-3.1-asr-flash-streaming",
+        display: "Qwen-Audio-3.1-ASR-Flash-Streaming（实时）",
+        listed: true,
+        ws_realtime: true,
+        supports_inline_vocabulary: true,
+        supports_vocabulary_id: true,
+        supports_language_hints: true,
+        use_legacy_audio_content: false,
+        regions: BOTH_REGIONS,
         is_default_batch: false,
         is_default_stream: false,
     },
@@ -1047,11 +1089,11 @@ fn qwen_model_spec(model: &str) -> Option<&'static QwenModelSpec> {
     QWEN_MODELS.iter().find(|s| s.id == model)
 }
 
-/// qwen（DashScope）语音识别模型清单，按地域过滤。
+/// qwen（DashScope）语音识别模型清单，按地域过滤，**不含隐藏的历史模型**。
 pub fn qwen_models(region: DashScopeRegion) -> Vec<ModelInfo> {
     QWEN_MODELS
         .iter()
-        .filter(|s| s.regions.contains(&region))
+        .filter(|s| s.listed && s.regions.contains(&region))
         .map(|s| ModelInfo {
             id: s.id.to_string(),
             display_name: s.display.to_string(),
@@ -1105,7 +1147,8 @@ fn qwen_uses_legacy_audio_content(model: &str) -> bool {
 /// 取代了两处硬编码回退：`QwenAsrProvider::MODEL` 常量与
 /// `asr_start_streaming` 里的 `"paraformer-realtime-v2"` 字面量。
 pub fn qwen_default_model(ws: bool, region: DashScopeRegion) -> &'static str {
-    let avail = |s: &QwenModelSpec| s.regions.contains(&region) && s.ws_realtime == ws;
+    // 只在「已列出」的模型里挑默认：隐藏的历史模型不该被选为当前模型
+    let avail = |s: &QwenModelSpec| s.listed && s.regions.contains(&region) && s.ws_realtime == ws;
     QWEN_MODELS
         .iter()
         .find(|s| {
@@ -1597,6 +1640,75 @@ mod tests {
         assert!(!sg.contains(&"fun-asr-realtime-2026-02-28".to_string()));
         // 新接入的同步模型两地都可用
         assert!(sg.contains(&"qwen-audio-3.0-asr-flash".to_string()));
+    }
+
+    #[test]
+    fn hidden_legacy_model_is_unlisted_but_still_resolvable() {
+        // 历史 fun-asr-realtime 在哪个地域都不出现。
+        // 断言用「成员/属性」而非数量——数量会随每次加模型而失效，
+        // 那样这个测试就沦为改一次模型改一次断言，失去防回归的意义。
+        for r in DashScopeRegion::ALL.iter().copied() {
+            let ids: Vec<_> = qwen_models(r).into_iter().map(|m| m.id).collect();
+            assert!(
+                !ids.contains(&"fun-asr-realtime".to_string()),
+                "地域 {} 不该列出历史模型: {ids:?}",
+                r.id()
+            );
+            // 列出的每一项都必须是显式标记 listed 的（隐藏项不得漏出去）
+            assert!(
+                ids.iter()
+                    .all(|id| qwen_model_spec(id).is_some_and(|s| s.listed)),
+                "地域 {} 列出了未标记 listed 的模型: {ids:?}",
+                r.id()
+            );
+        }
+
+        // 但规格必须仍能查到——否则老配置（model: "fun-asr-realtime"）会静默换
+        // body 格式，从「能用」变成「未知错误」。这是本次最容易漏的回归点。
+        assert!(!qwen_is_streaming_model("fun-asr-realtime"));
+        assert!(qwen_supports_vocabulary_id("fun-asr-realtime"));
+        assert!(!qwen_supports_inline_vocabulary("fun-asr-realtime"));
+        assert!(qwen_uses_legacy_audio_content("fun-asr-realtime"));
+        // 列出的模型则用新格式
+        assert!(!qwen_uses_legacy_audio_content("qwen-audio-3.0-asr-flash"));
+
+        // 隐藏模型不该被选为地域默认
+        for r in DashScopeRegion::ALL.iter().copied() {
+            assert_ne!(qwen_default_model(false, r), "fun-asr-realtime");
+            assert_ne!(qwen_default_model(true, r), "fun-asr-realtime");
+        }
+    }
+
+    #[test]
+    fn qwen_audio_31_models_are_available_in_both_regions() {
+        for r in DashScopeRegion::ALL.iter().copied() {
+            let ids: Vec<_> = qwen_models(r).into_iter().map(|m| m.id).collect();
+            assert!(
+                ids.contains(&"qwen-audio-3.1-asr-flash".to_string()),
+                "地域 {} 缺 3.1 同步版: {ids:?}",
+                r.id()
+            );
+            assert!(
+                ids.contains(&"qwen-audio-3.1-asr-flash-streaming".to_string()),
+                "地域 {} 缺 3.1 流式版: {ids:?}",
+                r.id()
+            );
+        }
+        // 同步版走非流式端点，流式版走 WebSocket
+        assert!(!qwen_is_streaming_model("qwen-audio-3.1-asr-flash"));
+        assert!(qwen_is_streaming_model(
+            "qwen-audio-3.1-asr-flash-streaming"
+        ));
+        // 两者都属于 qwen-audio-3.x 系，都支持即时热词
+        assert!(qwen_supports_inline_vocabulary("qwen-audio-3.1-asr-flash"));
+        assert!(qwen_supports_inline_vocabulary(
+            "qwen-audio-3.1-asr-flash-streaming"
+        ));
+        // 都不该被选为地域默认（默认仍是 3.0 同步 + paraformer 流式）
+        for r in DashScopeRegion::ALL.iter().copied() {
+            assert_eq!(qwen_default_model(false, r), "qwen-audio-3.0-asr-flash");
+            assert_eq!(qwen_default_model(true, r), "paraformer-realtime-v2");
+        }
     }
 
     #[test]

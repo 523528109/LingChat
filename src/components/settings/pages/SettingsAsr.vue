@@ -142,21 +142,29 @@
       </div>
     </section>
 
-    <!-- 识别服务商 -->
+    <!-- 识别服务 -->
     <section class="mb-6">
       <div class="text-brand mb-3 font-medium">{{ t("settings.asr.provider.title") }}</div>
 
-      <!-- 服务商选择：provider 由后端 list_provider_info 动态驱动 -->
+      <!-- 识别服务选择：**扁平列表**，每个模型一项（按 provider 分组呈现归属）。
+           原先的「服务商下拉 + 表单里的模型下拉」两层结构，让 Qwen 的模型根本
+           没有入口——选中的模型决定流式开关是否可用。
+
+           provider 的 config_fields 含 `model` 字段的（本地 llama-asr，模型清单要
+           向它的服务端 /v1/models 拉、服务没起就拉不到）只列一项代表该 provider，
+           模型仍在下方表单里选。这条规则是数据驱动的，不硬编码 provider id。 -->
       <label class="mb-1.5 block text-sm font-medium">{{
         t("settings.asr.provider.providerSelect")
       }}</label>
       <select
-        v-model="localSettings.active_provider"
+        v-model="activeServiceKey"
         class="shadow-glass focus:border-brand focus:ring-brand/20 mb-4 w-full rounded-lg border border-white/10 bg-white/10 px-3 py-2.5 text-sm text-sky-400 backdrop-blur-xl backdrop-saturate-150 transition-all duration-200 focus:ring-2 focus:outline-none"
       >
-        <option v-for="p in asrStore.providers" :key="p.id" :value="p.id">
-          {{ p.display_name }}{{ p.description ? `（${p.description}）` : "" }}
-        </option>
+        <optgroup v-for="g in serviceGroups" :key="g.provider.id" :label="g.provider.display_name">
+          <option v-for="item in g.items" :key="item.key" :value="item.key">
+            {{ item.label }}
+          </option>
+        </optgroup>
       </select>
 
       <div v-if="activeProviderInfo" class="space-y-3">
@@ -308,7 +316,7 @@ import { isAndroid } from "@/utils/platform";
 import { Toggle } from "../../base";
 import { useAsrStore } from "@/stores/modules/settings/asr";
 import { useUIStore } from "@/stores/modules/ui/ui";
-import { asrListModels, asrRecognizeWav, asrGetStatus } from "@/api/services/asr";
+import { asrRecognizeWav, asrGetStatus } from "@/api/services/asr";
 import { pcmToWavPcm16, trimSilencePcm } from "@/utils/asrAudio";
 import { parseAsrError } from "@/utils/asrError";
 import type { AsrSettings, SendMode, ProviderInfo, AsrRegionInfo } from "@/api/services/asr";
@@ -430,6 +438,39 @@ const activeProviderInfo = computed<ProviderInfo | undefined>(() =>
   asrStore.providers.find((p) => p.id === localSettings.value.active_provider),
 );
 
+// ── 扁平「识别服务」列表 ──────────────────────────────────────────
+
+/** 该 provider 的模型是否在它自己的表单里选。
+ *
+ *  判据是**数据驱动**的：config_fields 里有 `model` 字段的 provider（本地
+ *  llama-asr —— 它的模型清单要从服务端 /v1/models 拉，服务没起就拉不到），
+ *  在扁平列表里只占一项，模型交给表单里的动态下拉。不硬编码 provider id。 */
+function picksModelInForm(p: ProviderInfo | undefined): boolean {
+  return p?.config_fields.some((f) => f.key === "model") ?? false;
+}
+
+interface ServiceItem {
+  /** 编码为 `${provider_id}::${model_id}`；model_id 为空 = 该 provider 的模型在表单里选 */
+  key: string;
+  label: string;
+}
+
+const serviceGroups = computed<{ provider: ProviderInfo; items: ServiceItem[] }[]>(() =>
+  asrStore.providers.map((p) => {
+    if (picksModelInForm(p)) {
+      return { provider: p, items: [{ key: `${p.id}::`, label: p.display_name }] };
+    }
+    const models = asrStore.modelsByProvider[p.id] ?? [];
+    // 模型清单为空（拉取失败 / 该地域无模型）也要保留一项：否则该 provider
+    // 会从列表里整个消失，用户失去切回去修配置的入口
+    const items: ServiceItem[] =
+      models.length > 0
+        ? models.map((m) => ({ key: `${p.id}::${m.id}`, label: m.display_name }))
+        : [{ key: `${p.id}::`, label: `${p.display_name}（模型未列出）` }];
+    return { provider: p, items };
+  }),
+);
+
 // ProviderConfig 是后端约定的具名键（api_key / endpoint / extra），
 // 而 config_field.key 是动态字符串，需要做 Record 桥接才能用 v-model 写入任意键。
 // 只读：写路径走 ensureProviderConfig + debounce save。
@@ -442,6 +483,41 @@ const providerCfg = computed(() => {
   return localSettings.value.provider_configs[id] ?? { api_key: "", endpoint: "" };
 });
 const providerCfgRecord = computed(() => providerCfg.value as unknown as Record<string, string>);
+
+/**
+ * 扁平列表的选中值（`${provider_id}::${model_id}`），双向绑定。
+ *
+ * - **get**：由 `active_provider` + 该 provider 配置里的 `model` 拼出 key；
+ *   模型在表单里选的 provider（llama）恒用 provider 级 key
+ * - **set**：同时写 `active_provider` 与对应 provider 的 `model`
+ *
+ * **数据模型一点没变**——仍是原有的那两个字段。扁平化只是把「选服务商」和
+ * 「选模型」两次交互合并成一次，因此 `gates.ts`（流式判定）与 `session.ts`
+ * （识别命令的 providerId）无需任何改动。
+ */
+const activeServiceKey = computed({
+  get(): string {
+    const pid = localSettings.value.active_provider;
+    const info = asrStore.providers.find((p) => p.id === pid);
+    if (!info || picksModelInForm(info)) return `${pid}::`;
+    const key = `${pid}::${providerCfgRecord.value["model"] ?? ""}`;
+    // 配置里的模型不在当前清单里（历史的 fun-asr-realtime、或切地域后失效）
+    // → 回退到该 provider 的首项，否则 select 会显示空白
+    const group = serviceGroups.value.find((g) => g.provider.id === pid);
+    return group?.items.some((i) => i.key === key) ? key : (group?.items[0]?.key ?? key);
+  },
+  set(value: string) {
+    const sep = value.indexOf("::");
+    const pid = sep < 0 ? value : value.slice(0, sep);
+    const mid = sep < 0 ? "" : value.slice(sep + 2);
+    localSettings.value.active_provider = pid;
+    if (!mid) return;
+    // 要写**新** provider 自己的配置——providerCfg 此刻还是旧 provider 的
+    ensureProviderConfig(pid);
+    const record = localSettings.value.provider_configs[pid] as unknown as Record<string, string>;
+    record["model"] = mid;
+  },
+});
 
 // ── 地域联动：端点默认值的单一数据源在后端 ProviderInfo.regions ──
 // 前端不硬编码任何域名（否则会形成两份真相）。
@@ -514,13 +590,12 @@ function applyAsrPreset(model: string) {
 /** 模型列表拉取失败信息（llama-asr 服务未启动等），显示在模型字段下方 */
 const modelListError = ref("");
 
-/** 拉取当前 provider 的模型清单；失败时清空列表并记录错误（llama-asr 回退文本输入） */
+/** 拉取指定 provider 的模型清单；失败时记录错误（store 会把该 provider 的条目清空） */
 async function loadModels(id: string) {
   try {
-    asrStore.models = await asrListModels(id);
+    await asrStore.reloadModels(id);
     modelListError.value = "";
   } catch (e) {
-    asrStore.models = [];
     const info = parseAsrError(e);
     modelListError.value = t("settings.asr.provider.modelListFailed", {
       err: info.detail ?? info.code,

@@ -1359,8 +1359,8 @@ export default {
       "録音終了後にローカル認識へアップロードし、結果を段階的に表示（llama-server 結果ストリーム）",
     streamNotSupported: "選択中のモデルはストリーム認識に対応していません",
     provider: {
-      title: "音声認識プロバイダー",
-      providerSelect: "プロバイダー",
+      title: "音声認識",
+      providerSelect: "サービス",
       modelRefresh: "モデルリストを更新",
       modelListFailed: "モデルリストの取得に失敗しました：{err}",
       test: "接続テスト",
