@@ -221,7 +221,10 @@ pub struct AsrOptions {
 // Provider 凭证（最小子集，不依赖 settings.rs）
 // ============================================================================
 
-/// provider 运行时凭证：api_key + 端点 + model + 地域 + 热词。
+/// provider 运行时凭证：api_key + 端点 + model + 地域。
+///
+/// **不含热词**：热词是逐角色的，按调用经 [`AsrOptions::hotwords`] 传入，
+/// 不经过配置存储（见 `settings::ProviderConfig`）。
 #[derive(Debug, Clone, Default)]
 pub struct ProviderCredentials {
     pub api_key: String,
@@ -238,11 +241,6 @@ pub struct ProviderCredentials {
     pub model: String,
     /// 地域 id（见 [`super::region::DashScopeRegion`]）；空/未知 = 默认地域。
     pub region: String,
-    /// 预编译热词列表 ID。仅 `fun-asr-realtime` / `paraformer-realtime` 系支持
-    /// （`qwen-audio-3.x` 系走即时热词，见 [`Self::hotwords`]）。
-    pub vocabulary_id: String,
-    /// provider 配置级热词（兜底）。被 [`AsrOptions::hotwords`] 覆盖。
-    pub hotwords: Vec<Hotword>,
 }
 
 impl ProviderCredentials {
@@ -285,15 +283,6 @@ impl ProviderCredentials {
             e.to_string()
         } else {
             self.region_enum().ws_endpoint()
-        }
-    }
-
-    /// 本次调用生效的热词：调用级非空则覆盖配置级，否则回退配置级。
-    pub fn effective_hotwords(&self, opts: &AsrOptions) -> Vec<Hotword> {
-        if opts.hotwords.is_empty() {
-            self.hotwords.clone()
-        } else {
-            opts.hotwords.clone()
         }
     }
 }
@@ -467,10 +456,10 @@ impl AsrProvider for QwenAsrProvider {
 
         // 即时热词：文档明确仅 qwen-audio-3.x 系支持，对 fun-asr-realtime /
         // paraformer 系发这个参数很可能直接 400 —— 必须门控而非「有热词就发」。
-        let hotwords = self.cred.effective_hotwords(opts);
+        let hotwords = &opts.hotwords;
         if !hotwords.is_empty() {
             if qwen_supports_inline_vocabulary(model) {
-                body["parameters"]["vocabulary"] = hotwords_to_vocabulary_json(&hotwords);
+                body["parameters"]["vocabulary"] = hotwords_to_vocabulary_json(hotwords);
             } else {
                 warn!(
                     "[ASR] 模型 {model} 不支持即时热词，已忽略 {} 条热词（如需热词请改用 qwen-audio-3.x 系）",
@@ -597,8 +586,9 @@ fn parse_qwen_text(body: &str) -> Option<String> {
 /// - 音频必须是 16kHz 单声道 WAV（前端 OfflineAudioContext 已产出同格式）
 /// - `model` 必须是 `/v1/models` 返回的全名（简写会 400 model not found）
 /// - 响应 `text` 格式 `language <lang><asr_text><文本>`，切 `<asr_text>` 取文本
-/// - 热词：multipart `prompt` 字段做上下文偏置（偏置非强制；热词接口保留，
-///   设置页暂不做输入 UI，来源 `ProviderConfig.extra["hotwords"]` 逗号分隔）
+/// - 热词：multipart `prompt` 字段做上下文偏置（偏置非强制；来源是调用方传入的
+///   `AsrOptions::hotwords`，即逐角色的热词——设置页已无热词入口。
+///   另注：llama-server 是否真的消费 `prompt` 未经实测，见 V6）
 /// - 流式：llama-server 走 SSE（HTTP，OpenAI 兼容语义——每条 data 是当前
 ///   累积的完整转录）——结果流式经 `stream_recognize` 接入（provider_stream_llama.rs），
 ///   partial 经 `asr://stream_partial` 事件实时 emit；音频仍整段上传
@@ -685,8 +675,7 @@ impl AsrProvider for LlamaAsrProvider {
             );
         // 热词接口：作为 prompt 上下文偏置传入
         //（偏置非强制——提升特定词命中概率，不保证一定识别为热词）
-        let hotwords = self.cred.effective_hotwords(opts);
-        if let Some(prompt) = llama_prompt_from_hotwords(&hotwords) {
+        if let Some(prompt) = llama_prompt_from_hotwords(&opts.hotwords) {
             debug!(
                 "[ASR] llama-asr prompt 偏置（{} 字符）: {prompt}",
                 prompt.chars().count()
@@ -738,7 +727,7 @@ impl AsrProvider for LlamaAsrProvider {
         opts: &AsrOptions,
         on_partial: Option<Arc<dyn for<'a> Fn(&'a str) + Send + Sync + 'static>>,
     ) -> Result<AsrResult, AsrError> {
-        let prompt = llama_prompt_from_hotwords(&self.cred.effective_hotwords(opts));
+        let prompt = llama_prompt_from_hotwords(&opts.hotwords);
         super::provider_stream_llama::recognize_stream(
             &self.http,
             &self.cred,
@@ -973,9 +962,10 @@ struct QwenModelSpec {
     /// 走 WebSocket 实时端点（`false` = 同步 HTTP 端点）。
     ws_realtime: bool,
     /// 支持即时热词 `parameters.vocabulary`（文档明确**仅 qwen-audio-3.x 系**）。
+    ///
+    /// 预编译热词（`parameters.vocabulary_id`）随 ASR 设置页的热词字段一并移除，
+    /// 故这里不再有对应的能力标记。
     supports_inline_vocabulary: bool,
-    /// 支持预编译热词 `parameters.vocabulary_id`。
-    supports_vocabulary_id: bool,
     /// 支持 `language_hints`。
     supports_language_hints: bool,
     /// 同步 body 是否沿用旧格式 `content:[{"audio": "data:..."}]`。
@@ -1006,7 +996,6 @@ const QWEN_MODELS: &[QwenModelSpec] = &[
         listed: true,
         ws_realtime: false,
         supports_inline_vocabulary: true,
-        supports_vocabulary_id: true,
         supports_language_hints: true,
         use_legacy_audio_content: false,
         regions: BOTH_REGIONS,
@@ -1019,7 +1008,6 @@ const QWEN_MODELS: &[QwenModelSpec] = &[
         listed: true,
         ws_realtime: false,
         supports_inline_vocabulary: true,
-        supports_vocabulary_id: true,
         supports_language_hints: true,
         use_legacy_audio_content: false,
         regions: BOTH_REGIONS,
@@ -1038,7 +1026,6 @@ const QWEN_MODELS: &[QwenModelSpec] = &[
         listed: false,
         ws_realtime: false,
         supports_inline_vocabulary: false,
-        supports_vocabulary_id: true,
         supports_language_hints: false,
         use_legacy_audio_content: true,
         regions: BOTH_REGIONS,
@@ -1053,7 +1040,6 @@ const QWEN_MODELS: &[QwenModelSpec] = &[
         listed: true,
         ws_realtime: true,
         supports_inline_vocabulary: false,
-        supports_vocabulary_id: true,
         supports_language_hints: true,
         use_legacy_audio_content: false,
         regions: BOTH_REGIONS,
@@ -1073,7 +1059,6 @@ const QWEN_MODELS: &[QwenModelSpec] = &[
         listed: false,
         ws_realtime: true,
         supports_inline_vocabulary: false,
-        supports_vocabulary_id: true,
         supports_language_hints: true,
         use_legacy_audio_content: false,
         regions: CN_ONLY,
@@ -1090,7 +1075,6 @@ const QWEN_MODELS: &[QwenModelSpec] = &[
         listed: true,
         ws_realtime: true,
         supports_inline_vocabulary: true,
-        supports_vocabulary_id: true,
         supports_language_hints: true,
         use_legacy_audio_content: false,
         regions: BOTH_REGIONS,
@@ -1139,11 +1123,6 @@ pub fn qwen_supports_inline_vocabulary(model: &str) -> bool {
     qwen_model_spec(model).is_some_and(|s| s.supports_inline_vocabulary)
 }
 
-/// 该模型是否支持预编译热词 `parameters.vocabulary_id`。
-pub fn qwen_supports_vocabulary_id(model: &str) -> bool {
-    qwen_model_spec(model).is_some_and(|s| s.supports_vocabulary_id)
-}
-
 /// 该模型是否支持 `language_hints`。
 pub fn qwen_supports_language_hints(model: &str) -> bool {
     qwen_model_spec(model).is_some_and(|s| s.supports_language_hints)
@@ -1182,37 +1161,21 @@ pub fn qwen_default_model(ws: bool, region: DashScopeRegion) -> &'static str {
 
 /// 按模型能力构造 WS run-task 的可选参数。
 ///
-/// **热词门控集中在这里**：模型不支持某种热词机制时**不发**该字段，而不是
-/// 「有热词就发」—— 对不支持的模型发 `parameters.vocabulary` 很可能直接 400。
-/// 静默丢弃会让用户困惑，所以同时 warn 一条说明原因。
-pub fn build_stream_params(
-    model: &str,
-    cred: &ProviderCredentials,
-    opts: &AsrOptions,
-) -> super::provider_stream::StreamParams {
-    let hotwords = cred.effective_hotwords(opts);
+/// **热词门控集中在这里**：模型不支持即时热词时**不发** `parameters.vocabulary`
+/// —— 对不支持的模型发这个字段很可能直接 400。静默丢弃会让用户困惑，所以同时
+/// warn 一条说明原因。
+pub fn build_stream_params(model: &str, opts: &AsrOptions) -> super::provider_stream::StreamParams {
+    let hotwords = &opts.hotwords;
     let vocabulary = if hotwords.is_empty() {
         None
     } else if qwen_supports_inline_vocabulary(model) {
-        Some(hotwords_to_vocabulary_json(&hotwords))
+        Some(hotwords_to_vocabulary_json(hotwords))
     } else {
         warn!(
             "[ASR] 流式模型 {model} 不支持即时热词，已忽略 {} 条热词\
-             （该模型族只支持预编译热词表 vocabulary_id）",
+             （该模型族不支持 parameters.vocabulary）",
             hotwords.len()
         );
-        None
-    };
-
-    if !cred.vocabulary_id.trim().is_empty() && !qwen_supports_vocabulary_id(model) {
-        warn!(
-            "[ASR] 模型 {model} 不支持预编译热词表，已忽略 vocabulary_id={}",
-            cred.vocabulary_id.trim()
-        );
-    }
-    let vocabulary_id = if qwen_supports_vocabulary_id(model) {
-        Some(cred.vocabulary_id.trim().to_string()).filter(|s| !s.is_empty())
-    } else {
         None
     };
 
@@ -1225,7 +1188,6 @@ pub fn build_stream_params(
             None
         },
         vocabulary,
-        vocabulary_id,
     }
 }
 
@@ -1439,32 +1401,6 @@ fn qwen_asr_config_fields() -> Vec<AsrConfigField> {
             ),
             options: Vec::new(),
         },
-        AsrConfigField {
-            key: "vocabulary_id",
-            label: "热词表 ID（预编译热词）",
-            kind: ConfigFieldKind::Text,
-            required: false,
-            default_value: None,
-            placeholder: Some("vocab-xxxxxxxx"),
-            hint: Some(
-                "仅 fun-asr-realtime / paraformer-realtime 系生效（qwen-audio-3.x 系用不上的话请填下方热词）。\
-                 需在百炼控制台预先创建，且建表时的 target_model 必须与识别模型一致，否则热词静默不生效",
-            ),
-            options: Vec::new(),
-        },
-        AsrConfigField {
-            key: "hotwords",
-            label: "热词（可选）",
-            kind: ConfigFieldKind::Text,
-            required: false,
-            default_value: None,
-            placeholder: Some("量子计算, Anthropic:5, 厄洛替尼"),
-            hint: Some(
-                "逗号/分号/空白分隔；可选权重「词:权重」（1-5，或 50 为超级热词），缺省 4。\
-                 仅 qwen-audio-3.x 系支持即时热词；fun-asr-realtime / paraformer 系请改用上方的热词表 ID",
-            ),
-            options: Vec::new(),
-        },
     ]
 }
 
@@ -1498,20 +1434,6 @@ fn llama_asr_config_fields() -> Vec<AsrConfigField> {
             default_value: None,
             placeholder: Some("本地服务无需填写"),
             hint: Some("llama-server 带 --api-key 部署时填写，否则留空"),
-            options: Vec::new(),
-        },
-        AsrConfigField {
-            key: "hotwords",
-            label: "热词（可选）",
-            kind: ConfigFieldKind::Text,
-            required: false,
-            default_value: None,
-            placeholder: Some("量子计算, Anthropic, 厄洛替尼"),
-            hint: Some(
-                "逗号/分号/空白分隔，作为 prompt 偏置提升专名命中率。\
-                 总长超 200 字符会截断。注意：本地服务是否消费 prompt 尚未验证，\
-                 若无效可开 llama-server --verbose 核对",
-            ),
             options: Vec::new(),
         },
     ]
@@ -1615,6 +1537,22 @@ mod tests {
         assert_eq!(qwen_region_override(None), None);
         assert_eq!(qwen_region_override(Some("")), None);
         assert_eq!(qwen_region_override(Some("   ")), None);
+    }
+
+    #[test]
+    fn no_config_field_carries_hotwords() {
+        // 热词改为逐角色（按调用经 AsrOptions::hotwords 传入），ASR 设置页不再有
+        // 热词入口。回归防线：别把它们加回来——配置级的词会被角色级热词覆盖，
+        // 「填了不生效」比「没有这个入口」更糟。qwen 与 llama 都不该有。
+        for fields in [qwen_asr_config_fields(), llama_asr_config_fields()] {
+            for f in fields {
+                assert!(
+                    !f.key.contains("hotword") && f.key != "vocabulary_id",
+                    "配置字段 '{}' 是热词入口，应归角色设置而非 ASR 设置",
+                    f.key
+                );
+            }
+        }
     }
 
     #[test]
@@ -1768,7 +1706,6 @@ mod tests {
         // 但规格必须仍能查到——否则老配置（model: "fun-asr-realtime"）会静默换
         // body 格式，从「能用」变成「未知错误」。这是本次最容易漏的回归点。
         assert!(!qwen_is_streaming_model("fun-asr-realtime"));
-        assert!(qwen_supports_vocabulary_id("fun-asr-realtime"));
         assert!(!qwen_supports_inline_vocabulary("fun-asr-realtime"));
         assert!(qwen_uses_legacy_audio_content("fun-asr-realtime"));
         // 列出的模型则用新格式
@@ -1821,7 +1758,6 @@ mod tests {
             "fun-asr-realtime-2026-02-28"
         ));
         assert!(!qwen_supports_inline_vocabulary("paraformer-realtime-v2"));
-        assert!(qwen_supports_vocabulary_id("paraformer-realtime-v2"));
     }
 
     // ── 端点派生 ────────────────────────────────────────────────────
@@ -1884,26 +1820,7 @@ mod tests {
         );
     }
 
-    // ── 热词 ────────────────────────────────────────────────────────
-
-    #[test]
-    fn call_level_hotwords_override_config_level() {
-        let cred = ProviderCredentials {
-            hotwords: vec![Hotword::new("配置级")],
-            ..Default::default()
-        };
-        // 空 → 回退配置级
-        assert_eq!(
-            cred.effective_hotwords(&AsrOptions::default())[0].text,
-            "配置级"
-        );
-        // 非空 → 覆盖
-        let opts = AsrOptions {
-            language_hint: None,
-            hotwords: vec![Hotword::new("调用级")],
-        };
-        assert_eq!(cred.effective_hotwords(&opts)[0].text, "调用级");
-    }
+    // ── 热词（只来自调用方，逐角色） ────────────────────────────────
 
     #[test]
     fn hotword_weights_are_clamped() {
@@ -1935,33 +1852,30 @@ mod tests {
 
     #[test]
     fn stream_params_gate_hotwords_by_model() {
-        // paraformer 系：不发即时热词，发 vocabulary_id
-        let cred = ProviderCredentials {
-            hotwords: vec![Hotword::new("张三")],
-            vocabulary_id: "vocab-abc".into(),
-            ..Default::default()
-        };
+        let hotwords = vec![Hotword::new("张三")];
         let opts = AsrOptions {
             language_hint: Some("zh".into()),
-            hotwords: Vec::new(),
+            hotwords: hotwords.clone(),
         };
-        let p = build_stream_params("paraformer-realtime-v2", &cred, &opts);
+        // paraformer 系：不支持即时热词 → 不发（发出去很可能 400）
+        let p = build_stream_params("paraformer-realtime-v2", &opts);
         assert!(p.vocabulary.is_none(), "paraformer 不支持即时热词，不该发");
-        assert_eq!(p.vocabulary_id.as_deref(), Some("vocab-abc"));
         assert_eq!(p.language_hint.as_deref(), Some("zh"));
 
-        // 不支持的模型上配了 vocabulary_id → 忽略（避免 400）
-        let p2 = build_stream_params("不存在的模型", &cred, &opts);
-        assert!(p2.vocabulary_id.is_none());
-        assert!(p2.language_hint.is_none());
+        // qwen-audio-3.x 系：支持即时热词
+        let p2 = build_stream_params("qwen-audio-3.1-asr-flash-streaming", &opts);
+        assert!(p2.vocabulary.is_some());
+
+        // 未知模型：能力标记全无 → 两个可选参数都不发
+        let p3 = build_stream_params("不存在的模型", &opts);
+        assert!(p3.vocabulary.is_none());
+        assert!(p3.language_hint.is_none());
     }
 
     #[test]
-    fn stream_params_omit_empty_hotwords_and_vocabulary_id() {
-        let cred = ProviderCredentials::default();
-        let p = build_stream_params("paraformer-realtime-v2", &cred, &AsrOptions::default());
+    fn stream_params_omit_absent_hotwords_and_language_hint() {
+        let p = build_stream_params("qwen-audio-3.1-asr-flash-streaming", &AsrOptions::default());
         assert!(p.vocabulary.is_none());
-        assert!(p.vocabulary_id.is_none());
         assert!(p.language_hint.is_none());
     }
 

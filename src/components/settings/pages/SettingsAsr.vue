@@ -254,7 +254,7 @@
             class="shadow-glass focus:border-brand focus:ring-brand/20 w-full rounded-lg border border-white/10 bg-white/10 px-3 py-2.5 text-sm text-white backdrop-blur-xl backdrop-saturate-150 transition-all duration-200 focus:ring-2 focus:outline-none"
           />
           <!-- 字段说明：后端每个 config_field 都带 hint，此前模板从未渲染（一直不可见）。
-               地域/热词表 ID 这类「不看说明一定填错」的字段依赖它 -->
+               地域、端点这类「不看说明一定填错」的字段依赖它 -->
           <p v-if="field.hint" class="mt-1.5 block text-sm text-gray-300">{{ field.hint }}</p>
           <p v-if="field.key === 'model' && modelListError" class="mt-1 text-sm text-red-400">
             {{ modelListError }}

@@ -35,8 +35,9 @@ fn parse_source(s: &str) -> Result<AsrSource, String> {
 /// [{"text": "量子计算", "weight": 5}]          // 带权重
 /// ```
 ///
-/// 本次没有「角色级热词」来源，前端可以一直传 `None`（走 provider 配置级兜底）；
-/// 未来接入角色级热词时只需在调用处填这个参数，**provider 侧零改动**。
+/// **这是热词的唯一入口**：ASR 设置页已不再有热词设置，热词归角色
+/// （每个角色独立、存数据库），接入时只需在调用处填这个参数，
+/// **provider 侧零改动**。前端目前一律传 `None`。
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
 pub enum HotwordInput {

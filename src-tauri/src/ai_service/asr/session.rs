@@ -188,8 +188,8 @@ impl AsrSession {
         let on_partial = std::sync::Arc::new(move |text: &str| {
             let _ = app_handle.emit("asr://stream_partial", text.to_string());
         });
-        // 端点按地域派生（配置为空时）；热词按模型能力门控后注入
-        let params = provider::build_stream_params(model, cred, opts);
+        // 端点按地域派生（配置为空时）；热词（来自调用方，逐角色）按模型能力门控后注入
+        let params = provider::build_stream_params(model, opts);
         let tx = provider_stream::start_streaming(
             on_partial,
             cred.effective_ws_endpoint(),

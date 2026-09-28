@@ -28,10 +28,8 @@ export interface ProviderConfig {
   model: string;
   /** DashScope 地域 id（"cn-beijing" / "ap-southeast-1"）；空/未知 = 默认地域 */
   region?: string;
-  /** 预编译热词表 ID（fun-asr-realtime / paraformer-realtime 系） */
-  vocabulary_id?: string;
-  /** 热词，逗号/分号/空白分隔，可带权重（"词:4"） */
-  hotwords?: string;
+  // 热词不在这里：热词逐角色（存数据库），按调用经识别命令的 `hotwords`
+  // 参数传入，见下方 HotwordInput。
   extra?: Record<string, string>;
 }
 
@@ -136,8 +134,8 @@ export const asrStopListening = (source: AsrSource) =>
 
 export const asrVadProcessChunk = (pcm: number[]) => invoke<void>("asr_vad_process_chunk", { pcm });
 
-/** `hotwords` 省略时走后端 provider 配置级热词的兜底；
- *  未来接入角色级热词时在这里传入即可，provider 侧无需改动。 */
+/** `hotwords` 是热词的**唯一入口**（ASR 设置页已无热词设置）：热词逐角色、
+ *  存数据库，接入时在这里传入即可，provider 侧无需改动。目前一律省略。 */
 export const asrRecognizeWav = (params: {
   providerId: string;
   wavBytes: number[];

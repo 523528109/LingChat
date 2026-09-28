@@ -11,7 +11,7 @@ use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
 use super::error::AsrError;
-use super::provider::{Hotword, ProviderCredentials, QwenAsrProvider};
+use super::provider::{ProviderCredentials, QwenAsrProvider};
 use super::region::DashScopeRegion;
 
 /// 识别后文本如何处理。
@@ -55,14 +55,6 @@ pub struct ProviderConfig {
     /// DashScope 地域 id（见 [`DashScopeRegion`]）；空/未知 = 默认地域。
     #[serde(default)]
     pub region: String,
-    /// 预编译热词列表 ID（`fun-asr-realtime` / `paraformer-realtime` 系）。
-    #[serde(default)]
-    pub vocabulary_id: String,
-    /// 热词，逗号/分号/空白分隔；每项可带权重（`词:4`）。
-    /// 当前是 provider 级**兜底**——按调用传入的热词（`AsrOptions::hotwords`，
-    /// 未来接角色级热词）非空时会覆盖它。
-    #[serde(default)]
-    pub hotwords: String,
     #[serde(default)]
     pub extra: HashMap<String, String>,
 }
@@ -87,48 +79,18 @@ impl ProviderConfig {
     }
 
     /// 转换为 provider 内部使用的凭据结构。
+    ///
+    /// **热词不在这里**：热词是逐角色的，按调用经 `AsrOptions::hotwords` 传入
+    /// （见 [`super::provider::AsrOptions`]），provider 配置里不再有热词存储。
     pub fn to_credentials(&self) -> ProviderCredentials {
-        // 顶层 hotwords 优先；回退 extra["hotwords"]（兼容手工改过
-        // settings.json 的历史配置，那段解析逻辑一直存在但没有 UI 会写入）
-        let hotwords_text = if self.hotwords.trim().is_empty() {
-            self.extra.get("hotwords").map(String::as_str).unwrap_or("")
-        } else {
-            self.hotwords.as_str()
-        };
         ProviderCredentials {
             api_key: self.effective_api_key(),
             endpoint: self.endpoint.clone(),
             ws_endpoint: self.ws_endpoint.clone(),
             model: self.model.clone(),
             region: self.region.clone(),
-            vocabulary_id: self.vocabulary_id.clone(),
-            hotwords: parse_hotwords_text(hotwords_text),
         }
     }
-}
-
-/// 解析热词文本：逗号 / 分号 / 换行 / 空白分隔，每项可用 `词:权重` 指定权重
-///（全角冒号同样识别）。
-///
-/// 权重缺省为 [`Hotword::DEFAULT_WEIGHT`]；冒号后**不是合法 `u8`** 时按整项处理
-/// （如 `http://x:8080`，8080 超出 u8），不会把词截断。权重超界由
-/// [`Hotword::with_weight`] clamp。
-///
-/// 已知歧义：`12:30` 会被读成「词 12、权重 30」而非时间。这是 `词:权重` 语法的
-/// 固有代价，权衡见对应单测。
-fn parse_hotwords_text(s: &str) -> Vec<Hotword> {
-    s.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(|item| match item.rsplit_once([':', '：']) {
-            Some((text, w)) if !text.trim().is_empty() => match w.trim().parse::<u8>() {
-                Ok(weight) => Hotword::with_weight(text.trim(), weight),
-                // 冒号后不是数字 → 冒号是词的一部分（如 URL、时间戳）
-                Err(_) => Hotword::new(item),
-            },
-            _ => Hotword::new(item),
-        })
-        .collect()
 }
 
 /// 全部一次性迁移的**唯一入口**，调用方只该调它。
@@ -416,120 +378,6 @@ pub fn save(app: &AppHandle, s: &AsrSettings) -> Result<(), AsrError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 取热词文本，便于断言（权重另有专门用例）。
-    fn texts(cred: &ProviderCredentials) -> Vec<&str> {
-        cred.hotwords.iter().map(|h| h.text.as_str()).collect()
-    }
-
-    #[test]
-    fn to_credentials_parses_hotwords_from_extra() {
-        let cfg = ProviderConfig {
-            api_key: "k".into(),
-            endpoint: "http://127.0.0.1:8080".into(),
-            model: "models/Qwen3-ASR-1.7B-Q8_0.gguf".into(),
-            extra: [(
-                "hotwords".to_string(),
-                "Quantinuum, Anthropic, 量子计算".to_string(),
-            )]
-            .into_iter()
-            .collect(),
-            ..Default::default()
-        };
-        let cred = cfg.to_credentials();
-        assert_eq!(texts(&cred), vec!["Quantinuum", "Anthropic", "量子计算"]);
-        // 未指定权重 → 默认权重
-        assert!(
-            cred.hotwords
-                .iter()
-                .all(|h| h.weight == Hotword::DEFAULT_WEIGHT)
-        );
-    }
-
-    #[test]
-    fn to_credentials_empty_hotwords_without_extra() {
-        let cfg = ProviderConfig::default();
-        assert!(cfg.to_credentials().hotwords.is_empty());
-    }
-
-    #[test]
-    fn to_credentials_tolerates_semicolon_and_whitespace() {
-        let cfg = ProviderConfig {
-            extra: [("hotwords".to_string(), "A;B  C, D\nE".to_string())]
-                .into_iter()
-                .collect(),
-            ..Default::default()
-        };
-        let cred = cfg.to_credentials();
-        assert_eq!(texts(&cred), vec!["A", "B", "C", "D", "E"]);
-    }
-
-    #[test]
-    fn top_level_hotwords_takes_precedence_over_extra() {
-        // 顶层是设置页写入的位置；extra 只是历史兼容的兜底
-        let cfg = ProviderConfig {
-            hotwords: "新词".into(),
-            extra: [("hotwords".to_string(), "旧词".to_string())]
-                .into_iter()
-                .collect(),
-            ..Default::default()
-        };
-        assert_eq!(texts(&cfg.to_credentials()), vec!["新词"]);
-    }
-
-    #[test]
-    fn to_credentials_parses_hotword_weights() {
-        let cfg = ProviderConfig {
-            hotwords: "张三:5, 李四：50, 语音实验室".into(),
-            ..Default::default()
-        };
-        let cred = cfg.to_credentials();
-        assert_eq!(texts(&cred), vec!["张三", "李四", "语音实验室"]);
-        assert_eq!(cred.hotwords[0].weight, 5);
-        // 全角冒号同样识别
-        assert_eq!(cred.hotwords[1].weight, 50);
-        assert_eq!(cred.hotwords[2].weight, Hotword::DEFAULT_WEIGHT);
-    }
-
-    #[test]
-    fn hotword_weight_is_clamped() {
-        let cfg = ProviderConfig {
-            hotwords: "甲:0, 乙:255".into(),
-            ..Default::default()
-        };
-        let cred = cfg.to_credentials();
-        assert_eq!(cred.hotwords[0].weight, 1);
-        assert_eq!(cred.hotwords[1].weight, Hotword::MAX_WEIGHT);
-    }
-
-    #[test]
-    fn colon_that_is_not_a_valid_weight_stays_in_the_word() {
-        // 冒号后不是合法 u8 权重 → 冒号属于词本身，不能把词截断
-        //（8080 超出 u8，解析失败 → 整项保留）
-        let cfg = ProviderConfig {
-            hotwords: "http://example.com:8080".into(),
-            ..Default::default()
-        };
-        assert_eq!(
-            texts(&cfg.to_credentials()),
-            vec!["http://example.com:8080"]
-        );
-    }
-
-    #[test]
-    fn trailing_colon_number_is_always_read_as_weight() {
-        // 已知歧义：`12:30` 既可读作时间、也可读作「词 12 权重 30」。
-        // 按阿里云 `词:权重` 的约定的优先级，尾随的 `:数字` 一律判为权重
-        //（30 落在 u8 内）。热词多为产品名/术语，含冒号的写法罕见；
-        // 真要表达字面量，用不含冒号的写法即可。
-        let cfg = ProviderConfig {
-            hotwords: "12:30".into(),
-            ..Default::default()
-        };
-        let cred = cfg.to_credentials();
-        assert_eq!(texts(&cred), vec!["12"]);
-        assert_eq!(cred.hotwords[0].weight, 30);
-    }
 
     #[test]
     fn migration_fills_region_and_endpoints_for_fresh_config() {

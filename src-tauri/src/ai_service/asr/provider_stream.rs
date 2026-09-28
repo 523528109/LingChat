@@ -54,8 +54,6 @@ pub struct StreamParams {
     pub language_hint: Option<String>,
     /// `parameters.vocabulary` 即时热词 `{"词": 权重}`；None = 不发。
     pub vocabulary: Option<JsonValue>,
-    /// `parameters.vocabulary_id` 预编译热词表 ID；None/空 = 不发。
-    pub vocabulary_id: Option<String>,
 }
 
 /// 流式会话命令（由 session 侧转发）。
@@ -177,17 +175,9 @@ fn build_run_task_payload(model: &str, params: &StreamParams) -> (String, Vec<u8
     {
         p["language_hints"] = json!([lang]);
     }
-    // 即时热词（仅 qwen-audio-3.x-asr-flash-streaming 支持，门控在调用方）
+    // 即时热词（仅 qwen-audio-3.x 系支持，门控在调用方）
     if let Some(vocab) = &params.vocabulary {
         p["vocabulary"] = vocab.clone();
-    }
-    // 预编译热词表 ID（fun-asr-realtime / paraformer 系走这条）
-    if let Some(id) = params
-        .vocabulary_id
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        p["vocabulary_id"] = json!(id);
     }
     (
         task_id,
@@ -502,34 +492,29 @@ mod tests {
         let p = &v["payload"]["parameters"];
         assert!(p.get("language_hints").is_none());
         assert!(p.get("vocabulary").is_none());
-        assert!(p.get("vocabulary_id").is_none());
     }
 
     #[test]
-    fn run_task_includes_vocabulary_and_vocabulary_id_when_present() {
+    fn run_task_includes_vocabulary_when_present() {
         let params = StreamParams {
             language_hint: None,
             vocabulary: Some(json!({"张三": 5})),
-            vocabulary_id: Some("vocab-abc".into()),
         };
-        let (_, body) = build_run_task_payload("qwen-audio-3.0-asr-flash-streaming", &params);
+        let (_, body) = build_run_task_payload("qwen-audio-3.1-asr-flash-streaming", &params);
         let v: JsonValue = serde_json::from_slice(&body).expect("合法 JSON");
         assert_eq!(v["payload"]["parameters"]["vocabulary"]["张三"], 5);
-        assert_eq!(v["payload"]["parameters"]["vocabulary_id"], "vocab-abc");
     }
 
     #[test]
-    fn run_task_skips_blank_optional_strings() {
+    fn run_task_skips_blank_language_hint() {
         // 空串与纯空白等同未配置，不能发出去
         let params = StreamParams {
             language_hint: Some("   ".into()),
             vocabulary: None,
-            vocabulary_id: Some("  ".into()),
         };
         let (_, body) = build_run_task_payload("paraformer-realtime-v2", &params);
         let v: JsonValue = serde_json::from_slice(&body).expect("合法 JSON");
         let p = &v["payload"]["parameters"];
         assert!(p.get("language_hints").is_none());
-        assert!(p.get("vocabulary_id").is_none());
     }
 }
