@@ -7,6 +7,7 @@
   <div
     class="absolute z-30 flex cursor-pointer"
     :class="[horizontal ? 'w-[85%] flex-col' : 'inset-x-0 justify-center px-2', frameClass]"
+    :style="frameStyle"
     @click="emit('advance')"
   >
     <div
@@ -85,6 +86,15 @@ const props = defineProps<{
   /** 左右置时气泡贴窗口上边还是下边（父级按宠物在屏幕上的高低镜像过来）；
    *  上下置时无意义 —— 它们的贴边由 `side` 唯一决定（上置贴底、下置贴顶） */
   align?: BubbleAlign;
+  /**
+   * 左右置时内容相对**所贴那条边**的额外内缩（CSS px，父级镜像过来）。
+   *
+   * 本组件的内容贴的是本窗口的上/下边，而本窗口与宠物窗同边对齐；宠物窗下半截是透明的
+   * 输入带，宠物贴到屏幕上/下沿时那条边会跑到工作区外，内容跟着被推出去。父级把溢出量
+   * 算好（见 PetMode.vue 的 bubbleAlignInset），这里把内容拉回工作区内 —— 边角处气泡
+   * 因此紧贴屏幕边缘。上下置不传（它们的贴边由 `side` 决定，不靠窗口的上下边）。
+   */
+  alignInset?: number;
 }>();
 
 const emit = defineEmits<{ advance: []; drained: []; "typing-change": [typing: boolean] }>();
@@ -109,11 +119,29 @@ const frameClass = computed(() => [
     ? [
         // 左右置：贴窗口左边（气泡在宠物右侧）或右边（气泡在宠物左侧），长尾余量留在宠物那一侧
         side.value === "left" ? "right-(--tail) items-end" : "left-(--tail) items-start",
-        top.value ? "top-0" : "bottom-0",
       ]
     : [top.value ? "top-(--tail) items-start" : "bottom-(--tail) items-end"]),
   props.visible ? "" : "pointer-events-none",
 ]);
+
+/**
+ * 左右置时的纵向锚点（贴在窗口上边还是下边，再让出内缩量）。
+ *
+ * 内缩量只能是内联样式：它由宠物窗按「宠物窗贴边出屏多少」实算，值会随拖动连续变化，
+ * 写死成 Tailwind 类既表达不了也没必要。上下置时返回 undefined，定位完全交给 frameClass。
+ *
+ * 补一条短过渡：内缩量是跨窗口（宠物窗算 → IPC → 本窗口）来的，落地时刻与气泡窗被 Rust
+ * 挪动的时刻差着几毫秒到一两帧，拖动时表现为内容在边缘附近抖；过渡把它抹平，同时让
+ * 「换边/换贴边」那种整块跳变也能滑过去，而不是硬切。
+ */
+const ALIGN_INSET_TRANSITION_MS = 120;
+
+const frameStyle = computed(() => {
+  if (!horizontal.value) return undefined;
+  const inset = Math.max(0, props.alignInset ?? 0);
+  const transition = `top ${ALIGN_INSET_TRANSITION_MS}ms ease-out, bottom ${ALIGN_INSET_TRANSITION_MS}ms ease-out`;
+  return top.value ? { top: `${inset}px`, transition } : { bottom: `${inset}px`, transition };
+});
 
 /**
  * 长尾的朝向与位置：尾尖永远指向宠物（外半截落在窗口让出的 TAIL 预留区里）。

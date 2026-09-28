@@ -20,6 +20,7 @@
       :max-height="bubbleMaxHeight"
       :side="side"
       :align="align"
+      :align-inset="alignInset"
       @typing-change="onTypingChange"
     />
   </div>
@@ -95,6 +96,15 @@ const side = ref<BubbleSide>("above");
 const align = ref<BubbleAlign>("top");
 
 /**
+ * 左右置时内容相对所贴那条边的额外内缩（CSS px）。
+ *
+ * 内容贴的是本窗口的上/下边，而本窗口按 `align` 与宠物窗同边对齐；宠物窗下半截是透明的
+ * 输入带，宠物贴到屏幕上/下沿时那条边会跑到工作区外，内容会被一起推出去。宠物窗把溢出量
+ * 算好后镜像过来（见 PetMode.vue 的 bubbleAlignInset），这里只负责转交给 DialogueBox。
+ */
+const alignInset = ref(0);
+
+/**
  * 换位相位。
  *
  * 气泡窗是独立窗口，位置由 Rust 改，**跳位是瞬时的**：直接把内容画到新位置会看到
@@ -135,6 +145,7 @@ const applyMirror = (m: BubbleMirror) => {
   if (m.petScale > 0) scale.value = m.petScale;
   if (m.bubbleSide) side.value = m.bubbleSide;
   if (m.bubbleAlign === "top" || m.bubbleAlign === "bottom") align.value = m.bubbleAlign;
+  alignInset.value = Math.max(0, m.alignInset ?? 0);
   swapping.value = Boolean(m.swapping);
   // 首个非空台词整段显示（复现现状）；此后任何一句都是新台词 → 播打字机
   if (!firstLineSeen && m.line.trim()) {

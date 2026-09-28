@@ -33,6 +33,15 @@ export interface BubbleMirror {
   /** 左右置时气泡贴窗口上边还是下边（由宠物在屏幕上的高低决定，见 PetMode.vue）。
    *  上下置时无意义 —— 它们的贴边由 `bubbleSide` 唯一决定。 */
   bubbleAlign: BubbleAlign;
+  /**
+   * 左右置时内容相对**所贴那条边**的额外内缩（CSS px）。
+   *
+   * 内容贴的是气泡窗的上/下边，而气泡窗按 `bubbleAlign` 与宠物窗**同边对齐**：宠物窗
+   * 下半截是透明的输入带，宠物贴到屏幕上/下沿时那条边已经跑到工作区外（头像贴任务栏时
+   * 窗底出屏 64px），内容会被一起推出去。宠物窗把溢出量算出来镜像过来，气泡窗据此把内容
+   * 拉回工作区内 —— 边角处气泡因此紧贴屏幕边缘，而不是飘在宠物头顶。
+   */
+  alignInset: number;
   /** 换位过程中（先淡出、窗口跳位、再淡入），气泡窗用它把整段内容淡掉，遮住跳位。 */
   swapping: boolean;
   notification: { isVisible: boolean; title: string; message: string; type: string };
