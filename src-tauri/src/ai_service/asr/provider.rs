@@ -83,6 +83,13 @@ pub enum ConfigFieldKind {
     Boolean,
     /// 下拉单选（配合 [`AsrConfigField::options`]，如地域选择）。
     Select,
+    /// 密码框，但**值按地域分开存**（`provider_configs[id].api_keys[地域id]`）。
+    ///
+    /// UI 只显示当前地域的那一个框（切地域时内容随之切换），存储却是每个
+    /// 地域一份——因为各地域的 Key 互相独立、不能混用（见 [`super::region`]）。
+    /// 前端需要的当前地域取自 `ProviderInfo.regions` + 配置里的 `region`，
+    /// 因此本字段不需要自己的 `options`。
+    PasswordMap,
 }
 
 /// [`ConfigFieldKind::Select`] 的一个选项。
@@ -360,9 +367,12 @@ impl QwenAsrProvider {
 
     pub fn new(http: reqwest::Client, cred: ProviderCredentials) -> Result<Self, AsrError> {
         if !cred.has_api_key() {
-            return Err(AsrError::MissingCredentials(
-                "Qwen ASR 需要 DashScope api_key".into(),
-            ));
+            // 带上地域名：Key 是分地域存的，只说「需要 api_key」无法指出该去哪个
+            // 地域的输入框填（切到没配过的地域时最容易撞上）
+            return Err(AsrError::MissingCredentials(format!(
+                "Qwen ASR 需要 DashScope api_key（当前地域：{}）",
+                cred.region_enum().label()
+            )));
         }
         Ok(Self { http, cred })
     }
@@ -1349,19 +1359,27 @@ fn qwen_asr_config_fields() -> Vec<AsrConfigField> {
             default_value: Some(DashScopeRegion::DEFAULT.id()),
             placeholder: None,
             hint: Some(
-                "华北2（北京）与新加坡的域名、API Key、模型列表互相独立，不能混用；\
-                 切换后请填对应地域的 API Key",
+                "华北2（北京）与新加坡的域名、API Key、模型列表互相独立，不能混用。\
+                 下方 API Key 按地域分开保存，切换后显示的是该地域自己的那一份",
             ),
             options: region_field_options(),
         },
         AsrConfigField {
-            key: "api_key",
+            // 不是 `api_key` 而是按地域分开存的 `api_keys` 映射：北京与新加坡的
+            // Key 互相独立，切换地域不能把另一个地域的 Key 冲掉。UI 仍只显示
+            // 当前地域的一个框（见 ConfigFieldKind::PasswordMap）。
+            key: "api_keys",
             label: "DashScope API Key",
-            kind: ConfigFieldKind::Password,
+            kind: ConfigFieldKind::PasswordMap,
             required: true,
             default_value: None,
             placeholder: Some("sk-..."),
-            hint: Some("阿里云百炼（Model Studio）平台 Key，须与所选地域一致"),
+            // hint 由前端以纯文本渲染（`{{ field.hint }}`），不能写 Markdown 记号
+            hint: Some(
+                "阿里云百炼（Model Studio）平台 Key，须与所选地域一致。\
+                 每个地域单独保存：切换上方地域后，这里显示的是该地域自己的 Key，\
+                 不会覆盖另一个地域已填的",
+            ),
             options: Vec::new(),
         },
         AsrConfigField {
@@ -1550,6 +1568,21 @@ mod tests {
         let ids: Vec<_> = region.options.iter().map(|o| o.value).collect();
         let expected: Vec<_> = DashScopeRegion::ALL.iter().map(|r| r.id()).collect();
         assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn qwen_api_key_field_is_region_scoped() {
+        let fields = qwen_asr_config_fields();
+        let key = fields.iter().find(|f| f.key == "api_keys").unwrap();
+        assert_eq!(key.kind, ConfigFieldKind::PasswordMap);
+        // 不能再留一个扁平的单键入口：两个入口会并存两份真相，
+        // 用户填了其中一个、另一个静默生效，且分地域存储形同虚设
+        assert!(!fields.iter().any(|f| f.key == "api_key"));
+
+        // llama-asr 无地域概念（regions 为空），Key 保持扁平的单键字段
+        let llama = llama_asr_config_fields();
+        assert!(llama.iter().any(|f| f.key == "api_key"));
+        assert!(!llama.iter().any(|f| f.key == "api_keys"));
     }
 
     #[test]

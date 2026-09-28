@@ -171,6 +171,11 @@
         <div v-for="field in activeProviderInfo.config_fields" :key="field.key">
           <label class="mb-1.5 block text-sm font-medium">
             {{ field.label }}
+            <!-- 分地域的字段标出当前地域：切到没配过的地域时框会变空，
+                 不写清是哪个地域的 Key 容易被误读成"Key 丢了" -->
+            <span v-if="field.kind === 'password_map' && activeRegion" class="text-gray-400">
+              （{{ activeRegion.label }}）
+            </span>
             <span v-if="field.required" class="text-red-500">*</span>
           </label>
           <!--
@@ -203,6 +208,15 @@
             v-else-if="field.kind === 'password'"
             type="password"
             v-model="providerCfgRecord[field.key]"
+            class="shadow-glass focus:border-brand focus:ring-brand/20 w-full rounded-lg border border-white/10 bg-white/10 px-3 py-2.5 text-sm text-white backdrop-blur-xl backdrop-saturate-150 transition-all duration-200 focus:ring-2 focus:outline-none"
+          />
+          <!-- 按地域分存的密码框（API Key）：只显示当前地域的那一个，
+               值绑定到 provider_configs[id].api_keys[当前地域] -->
+          <input
+            v-else-if="field.kind === 'password_map'"
+            type="password"
+            v-model="activeApiKey"
+            :placeholder="field.placeholder"
             class="shadow-glass focus:border-brand focus:ring-brand/20 w-full rounded-lg border border-white/10 bg-white/10 px-3 py-2.5 text-sm text-white backdrop-blur-xl backdrop-saturate-150 transition-all duration-200 focus:ring-2 focus:outline-none"
           />
           <input
@@ -319,7 +333,13 @@ import { useUIStore } from "@/stores/modules/ui/ui";
 import { asrRecognizeWav, asrGetStatus } from "@/api/services/asr";
 import { pcmToWavPcm16, trimSilencePcm } from "@/utils/asrAudio";
 import { parseAsrError } from "@/utils/asrError";
-import type { AsrSettings, SendMode, ProviderInfo, AsrRegionInfo } from "@/api/services/asr";
+import type {
+  AsrSettings,
+  SendMode,
+  ProviderInfo,
+  AsrRegionInfo,
+  ProviderConfig,
+} from "@/api/services/asr";
 
 const { t, te } = useI18n();
 const asrStore = useAsrStore();
@@ -530,6 +550,41 @@ const activeRegion = computed<AsrRegionInfo | undefined>(() => {
   const regions = providerRegions.value;
   if (regions.length === 0) return undefined;
   return regions.find((r) => r.id === (providerCfg.value.region ?? "")) ?? regions[0];
+});
+
+/** 当前 provider 的**原始**配置记录（未做缺省兜底）。
+ *
+ *  不走 `providerCfg`：那是给模板用的带兜底的 computed，返回值是联合类型，
+ *  取不到 `api_keys` 这类可选字段；写配置也不该写进那个临时兜底对象。 */
+function currentProviderCfg(): ProviderConfig | undefined {
+  return localSettings.value.provider_configs[localSettings.value.active_provider];
+}
+
+/**
+ * 当前地域的 API Key（读写）。
+ *
+ * Key 在**存储上按地域分开**（`api_keys[地域 id]`），UI 只显示当前地域的这一个
+ * 框——切地域时框里的内容随之切换，另一个地域的 Key 不受影响，这是本次改动的
+ * 全部意义。后端在 `ProviderConfig::effective_api_key` 用同样的键读取。
+ *
+ * 地域 id 取自 `activeRegion`，它与后端 `DashScopeRegion::parse` 的回退规则一致
+ * （缺失/未知 → 第一个地域）：两边必须认同一个键，否则会出现「端点按北京派生、
+ * Key 却查不到」而静默变空。
+ *
+ * 该地域没配过时返回空串，而不是回退到另一个地域的 Key——让用户看出这里还没填。
+ */
+const activeApiKey = computed({
+  get(): string {
+    const region = activeRegion.value;
+    if (!region) return "";
+    return currentProviderCfg()?.api_keys?.[region.id] ?? "";
+  },
+  set(value: string) {
+    const cfg = currentProviderCfg();
+    const region = activeRegion.value;
+    if (!cfg || !region) return;
+    cfg.api_keys = { ...(cfg.api_keys ?? {}), [region.id]: value };
+  },
 });
 
 /** 该端点值是否恰好等于某个地域的默认端点（用于判断「未被用户手改过」） */

@@ -32,6 +32,15 @@ pub enum SendMode {
 /// —— 只加 `AsrConfigField` 而不加字段，用户填的值会被 serde 静默丢弃。
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ProviderConfig {
+    /// 按地域分存的 API Key，键为地域 id（见 [`DashScopeRegion::id`]）。
+    ///
+    /// 各地域的 Key 互相独立、不能混用，共用单个字段会让切换地域必须重填。
+    /// UI 只显示当前地域的那一个框，读写都落在这里。
+    #[serde(default)]
+    pub api_keys: HashMap<String, String>,
+    /// **历史字段**：引入上方的 `api_keys` 之前的唯一 Key。仍被
+    /// [`Self::effective_api_key`] 作为兜底读取（老配置在迁移前、以及
+    /// llama-asr 这种无地域概念的 provider 都靠它），但设置页不再写入。
     #[serde(default)]
     pub api_key: String,
     /// 非实时（同步）端点。
@@ -59,6 +68,24 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
+    /// 当前地域生效的 API Key。
+    ///
+    /// 键用**解析后**的地域 id（[`DashScopeRegion::parse`]）而非 `region` 原值：
+    /// 空/拼错的地域在别处一律回退默认地域，这里必须用同一个键，否则会出现
+    /// 「端点按北京派生、Key 却按未知 id 查不到」而静默变空。
+    ///
+    /// 回退链：`api_keys[地域]`（非空白）→ 顶层 `api_key`（迁移前的历史配置，
+    /// 以及 llama-asr——它无地域概念，`api_keys` 恒空）。
+    pub fn effective_api_key(&self) -> String {
+        let region_id = DashScopeRegion::parse(&self.region).id();
+        self.api_keys
+            .get(region_id)
+            .map(String::as_str)
+            .filter(|k| !k.trim().is_empty())
+            .unwrap_or(self.api_key.as_str())
+            .to_string()
+    }
+
     /// 转换为 provider 内部使用的凭据结构。
     pub fn to_credentials(&self) -> ProviderCredentials {
         // 顶层 hotwords 优先；回退 extra["hotwords"]（兼容手工改过
@@ -69,7 +96,7 @@ impl ProviderConfig {
             self.hotwords.as_str()
         };
         ProviderCredentials {
-            api_key: self.api_key.clone(),
+            api_key: self.effective_api_key(),
             endpoint: self.endpoint.clone(),
             ws_endpoint: self.ws_endpoint.clone(),
             model: self.model.clone(),
@@ -104,6 +131,19 @@ fn parse_hotwords_text(s: &str) -> Vec<Hotword> {
         .collect()
 }
 
+/// 全部一次性迁移的**唯一入口**，调用方只该调它。
+///
+/// 内部顺序固定且不可交换：先补地域与端点，再按地域搬 API Key —— 反过来会
+/// 把 Key 搬到（尚未补齐的）错误地域上。合成一个函数就是为了让这个顺序
+/// 无法被调用方弄错。
+///
+/// 返回是否有变更（两段各自判断，任一有变更即为 true），调用方据此决定要不要落盘。
+pub fn migrate_provider_cfg(provider_id: &str, cfg: &mut ProviderConfig) -> bool {
+    let region_fixed = migrate_region_and_endpoints(provider_id, cfg);
+    let key_moved = migrate_api_key_to_region(provider_id, cfg);
+    region_fixed || key_moved
+}
+
 /// 一次性迁移引入地域/双端点之前的 qwen 老配置。
 ///
 /// **只对 [`QwenAsrProvider`] 生效**：llama-asr 的本地地址没有地域语义，
@@ -112,7 +152,7 @@ fn parse_hotwords_text(s: &str) -> Vec<Hotword> {
 /// 以 `region` 是否为空作为「是否已迁移」的判据 —— 迁移过就不再干预，
 /// 尊重用户后续的手改与清空（否则每次启动都会把用户清掉的端点填回去）。
 /// 返回是否有变更，调用方据此决定要不要落盘。
-pub fn migrate_provider_cfg(provider_id: &str, cfg: &mut ProviderConfig) -> bool {
+fn migrate_region_and_endpoints(provider_id: &str, cfg: &mut ProviderConfig) -> bool {
     if provider_id != QwenAsrProvider::ID || !cfg.region.trim().is_empty() {
         return false;
     }
@@ -142,6 +182,33 @@ pub fn migrate_provider_cfg(provider_id: &str, cfg: &mut ProviderConfig) -> bool
     if cfg.ws_endpoint.trim().is_empty() {
         cfg.ws_endpoint = region.ws_endpoint();
     }
+    true
+}
+
+/// 一次性迁移引入「按地域分存 API Key」之前的那个唯一的 `api_key`。
+///
+/// **只对 [`QwenAsrProvider`] 生效**：llama-asr 的 Key 与地域无关（本地服务
+/// 的 `--api-key`），搬进映射反而会随地域切换而"消失"。
+///
+/// 以 `api_keys` 是否为空作为「是否已迁移」的判据 —— 不能用 `region`（那条
+/// 判据属于上一段迁移，凡是启动过一次的配置都已置位，这里会被永远跳过）。
+/// 已迁移过的配置不再干预，尊重用户后来的清空。
+///
+/// 搬到**解析后**的地域（与 [`ProviderConfig::effective_api_key`] 同键）：迁移时 `region`
+/// 可能为空或拼错，而读取侧一律按默认地域兜底，两边必须一致。
+/// 迁移成功后清空顶层 `api_key`，不留两份真相。
+fn migrate_api_key_to_region(provider_id: &str, cfg: &mut ProviderConfig) -> bool {
+    if provider_id != QwenAsrProvider::ID || !cfg.api_keys.is_empty() {
+        return false;
+    }
+    let legacy = cfg.api_key.trim();
+    if legacy.is_empty() {
+        return false;
+    }
+    let region_id = DashScopeRegion::parse(&cfg.region).id();
+    cfg.api_keys
+        .insert(region_id.to_string(), legacy.to_string());
+    cfg.api_key.clear();
     true
 }
 
@@ -541,5 +608,137 @@ mod tests {
         cfg.endpoint.clear();
         assert!(!migrate_provider_cfg("qwen-asr", &mut cfg));
         assert!(cfg.endpoint.is_empty());
+    }
+
+    // ── 按地域分存的 API Key ──────────────────────────────────────────
+
+    /// 造一个 qwen 配置：两个地域各一个 Key，外加可选的 legacy 顶层 Key。
+    fn cfg_with_keys(cn: Option<&str>, sg: Option<&str>, legacy: &str) -> ProviderConfig {
+        let mut api_keys = HashMap::new();
+        if let Some(k) = cn {
+            api_keys.insert("cn-beijing".to_string(), k.to_string());
+        }
+        if let Some(k) = sg {
+            api_keys.insert("ap-southeast-1".to_string(), k.to_string());
+        }
+        ProviderConfig {
+            api_keys,
+            api_key: legacy.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn effective_api_key_follows_the_selected_region() {
+        // 两个地域各存一份，切地域取到的是各自的那个——这正是本次改动的目的
+        let mut cfg = cfg_with_keys(Some("sk-cn"), Some("sk-sg"), "sk-legacy");
+
+        cfg.region = "cn-beijing".into();
+        assert_eq!(cfg.effective_api_key(), "sk-cn");
+
+        cfg.region = "ap-southeast-1".into();
+        assert_eq!(cfg.effective_api_key(), "sk-sg");
+    }
+
+    #[test]
+    fn effective_api_key_falls_back_to_legacy_when_region_slot_is_empty() {
+        // 迁移前的历史配置 / llama-asr（api_keys 恒空）都靠这条兜底
+        let mut cfg = cfg_with_keys(None, Some("sk-sg"), "sk-legacy");
+
+        cfg.region = "cn-beijing".into();
+        assert_eq!(cfg.effective_api_key(), "sk-legacy");
+
+        // 显式配了空串（用户在框里清空）同样算"没配"，不能把空串当成 Key
+        cfg.api_keys.insert("cn-beijing".into(), "   ".into());
+        assert_eq!(cfg.effective_api_key(), "sk-legacy");
+    }
+
+    #[test]
+    fn effective_api_key_resolves_unknown_region_to_the_default_slot() {
+        // 空/拼错的地域在别处一律回退默认地域，取 Key 必须用同一个键，
+        // 否则「端点按北京派生、Key 却查不到」
+        let cfg = cfg_with_keys(Some("sk-cn"), Some("sk-sg"), "sk-legacy");
+        for bogus in ["", "  ", "cn-shanghai", "火星"] {
+            let c = ProviderConfig {
+                region: bogus.into(),
+                ..cfg.clone()
+            };
+            assert_eq!(
+                c.effective_api_key(),
+                "sk-cn",
+                "地域 {bogus:?} 应取默认地域的 Key"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_moves_legacy_api_key_into_the_region_slot() {
+        let mut cfg = ProviderConfig {
+            api_key: "sk-old".into(),
+            region: "ap-southeast-1".into(),
+            ..Default::default()
+        };
+        assert!(migrate_provider_cfg("qwen-asr", &mut cfg));
+        assert_eq!(
+            cfg.api_keys.get("ap-southeast-1").map(String::as_str),
+            Some("sk-old")
+        );
+        // 顶层字段被清空，不留两份真相
+        assert!(cfg.api_key.is_empty());
+        // 迁移后取到的是搬过去的那份
+        assert_eq!(cfg.effective_api_key(), "sk-old");
+        // 幂等：再跑一次不报"有变更"
+        assert!(!migrate_provider_cfg("qwen-asr", &mut cfg));
+    }
+
+    #[test]
+    fn migration_moves_key_to_the_region_inferred_from_the_endpoint() {
+        // 顺序回归点：地域必须先于 Key 迁移落定。反过来会把 Key 搬到默认地域，
+        // 用户的国际站 Key 就永远取不到了。
+        let mut cfg = ProviderConfig {
+            api_key: "sk-intl".into(),
+            endpoint: "https://llm-abc.ap-southeast-1.maas.aliyuncs.com/api/v1".into(),
+            ..Default::default()
+        };
+        assert!(migrate_provider_cfg("qwen-asr", &mut cfg));
+        assert_eq!(cfg.region, "ap-southeast-1");
+        assert_eq!(
+            cfg.api_keys.get("ap-southeast-1").map(String::as_str),
+            Some("sk-intl")
+        );
+        assert!(cfg.api_keys.get("cn-beijing").is_none());
+    }
+
+    #[test]
+    fn migration_does_not_clobber_an_existing_api_keys_map() {
+        // 已迁移过（或用户已在新结构里填过）→ 一律不干预
+        let mut cfg = cfg_with_keys(Some("sk-new"), None, "sk-old");
+        cfg.region = "cn-beijing".into();
+        assert!(!migrate_provider_cfg("qwen-asr", &mut cfg));
+        assert_eq!(cfg.effective_api_key(), "sk-new");
+        assert_eq!(cfg.api_key, "sk-old", "未发生迁移，顶层字段不该被动");
+    }
+
+    #[test]
+    fn migration_skips_empty_legacy_key() {
+        // 全新用户（从没填过 Key）：不产生"有变更"，也就不会每次启动都落盘
+        let mut cfg = ProviderConfig {
+            api_key: "   ".into(),
+            ..Default::default()
+        };
+        assert!(!migrate_api_key_to_region("qwen-asr", &mut cfg));
+        assert!(cfg.api_keys.is_empty());
+    }
+
+    #[test]
+    fn migration_never_touches_llama_api_key() {
+        // llama-asr 的 Key 与地域无关，搬进映射只会让它随地域切换而"消失"
+        let mut cfg = ProviderConfig {
+            api_key: "sk-local".into(),
+            ..Default::default()
+        };
+        assert!(!migrate_api_key_to_region("llama-asr", &mut cfg));
+        assert!(cfg.api_keys.is_empty());
+        assert_eq!(cfg.effective_api_key(), "sk-local");
     }
 }

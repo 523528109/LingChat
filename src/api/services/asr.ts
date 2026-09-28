@@ -12,6 +12,14 @@ export interface AsrResult {
 }
 
 export interface ProviderConfig {
+  /**
+   * 按地域分存的 API Key，键为地域 id（"cn-beijing" / "ap-southeast-1"）。
+   *
+   * 各地域的 Key 互相独立、不能混用；设置页只显示当前地域的那一个框，
+   * 读写都落在这里（`api_keys[当前地域]`）。
+   */
+  api_keys?: Record<string, string>;
+  /** 历史字段：分地域存储之前的唯一 Key。后端仍作为兜底读取，设置页不再写入 */
   api_key: string;
   /** 非实时（同步）端点 */
   endpoint: string;
@@ -74,7 +82,14 @@ export interface AsrSettings {
 }
 
 /** 与后端 `provider.rs` 的 `ConfigFieldKind`（snake_case 字符串）严格对齐 */
-export type ConfigFieldKind = "text" | "password" | "number" | "boolean" | "select";
+export type ConfigFieldKind =
+  | "text"
+  | "password"
+  | "number"
+  | "boolean"
+  | "select"
+  /** 密码框，但值按地域分开存在 `provider_configs[id].api_keys[当前地域]` */
+  | "password_map";
 
 /** select 字段的一个选项 */
 export interface AsrConfigFieldOption {
