@@ -168,8 +168,15 @@ export const asrCancel = () => invoke<void>("asr_cancel");
 
 export const asrListProviders = () => invoke<ProviderInfo[]>("asr_list_providers");
 
-export const asrListModels = (providerId: string) =>
-  invoke<ModelInfo[]>("asr_list_models", { providerId });
+/**
+ * 拉取某 provider 的模型清单。
+ *
+ * `region` 传表单里**当前选中**的地域：模型清单是按地域过滤的，而保存设置
+ * 有 debounce（500ms），不传的话后端会按上一次落盘的地域返回——切地域后列表
+ * 要等下次打开设置页才更新（表现为"少/多一个模型"）。缺省/空 = 用落盘的配置。
+ */
+export const asrListModels = (providerId: string, region?: string) =>
+  invoke<ModelInfo[]>("asr_list_models", { providerId, region: region ?? null });
 
 export const asrGetSettings = () => invoke<AsrSettings>("asr_get_settings");
 

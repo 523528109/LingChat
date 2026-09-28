@@ -389,14 +389,18 @@ pub async fn asr_list_providers() -> Vec<ProviderInfo> {
     list_provider_info()
 }
 
+/// `region`：调用方当前选中的地域，优先于持久化配置（设置页改地域后要立刻刷新
+/// 模型清单，而保存有 500ms debounce，见 `provider::list_models`）。缺省/空白
+/// 时读持久化配置。
 #[tauri::command]
 pub async fn asr_list_models(
     provider_id: String,
+    region: Option<String>,
     app: AppHandle,
 ) -> Result<Vec<provider::ModelInfo>, String> {
     // llama-asr 需要发 HTTP 请求拉服务端模型列表（qwen 是静态清单，不走网络）
     let http = build_http().map_err(|e| err_to_user(&e))?;
-    provider::list_models(&provider_id, &app, &http)
+    provider::list_models(&provider_id, region.as_deref(), &app, &http)
         .await
         .map_err(|e| err_to_user(&e))
 }

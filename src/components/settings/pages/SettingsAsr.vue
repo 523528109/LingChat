@@ -617,9 +617,12 @@ function applyRegionEndpoints() {
 /**
  * 校验当前模型在（新的）地域下是否可用，不可用则回退为该地域的默认模型。
  *
- * 模型清单是地域相关的（如 fun-asr-realtime-2026-02-28 仅北京可用），留着
- * 一个该地域不存在的模型名会让后端请求直接 400。清单为空（拉取失败）时不改，
- * 避免网络问题误清用户配置；模型为空也不改——后端本就会回退地域默认。
+ * 模型清单是地域相关的，留着一个该地域不存在的模型名会让后端请求直接 400。
+ * 目前两个地域的清单恰好一致，但机制仍在（模型表里带 `region` 过滤），且这里
+ * 还是**已下线模型**的兜底：清单里没有了的历史模型（见 provider.rs 的
+ * `listed: false`）会在打开设置页时被换成地域默认。
+ * 清单为空（拉取失败）时不改，避免网络问题误清用户配置；模型为空也不改
+ * ——后端本就会回退地域默认。
  */
 function ensureModelValidForRegion() {
   const models = asrStore.models;
@@ -648,7 +651,10 @@ const modelListError = ref("");
 /** 拉取指定 provider 的模型清单；失败时记录错误（store 会把该 provider 的条目清空） */
 async function loadModels(id: string) {
   try {
-    await asrStore.reloadModels(id);
+    // 传表单里当前的地域而非让后端读配置：改地域后保存要等 500ms debounce
+    // 才落盘，而这行在保存之前就发出去了——不传就会拿到**旧地域**的清单，
+    // 表现为切地域后列表少/多一个模型，且要重开设置页才恢复
+    await asrStore.reloadModels(id, localSettings.value.provider_configs[id]?.region);
     modelListError.value = "";
   } catch (e) {
     const info = parseAsrError(e);

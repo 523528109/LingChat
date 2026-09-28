@@ -1029,9 +1029,9 @@ const QWEN_MODELS: &[QwenModelSpec] = &[
     },
     // 历史默认非流式模型。DashScope 已把它归入实时（WebSocket）族，但本项目的
     // 同步路径一直在用它且实测可用，故按旧格式保留规格，避免老配置失效。
-    // **不在设置页列出**（listed: false）——它与 fun-asr-realtime-2026-02-28 同名
-    // 不同协议，摆在列表里会让用户对着两个"Fun-ASR-Realtime"发懵；但老配置里
-    // 存着它的 model 名，规格必须仍能查到，否则会静默换 body 格式。
+    // **不在设置页列出**（listed: false）：它与 fun-asr-realtime-2026-02-28 同名
+    // 不同协议，两条"Fun-ASR-Realtime"摆在列表里会让人误选；但老配置里存着它的
+    // model 名，规格必须仍能查到，否则会静默换 body 格式（它走旧 content 格式）。
     QwenModelSpec {
         id: "fun-asr-realtime",
         display: "Fun-ASR-Realtime（非实时·历史协议）",
@@ -1062,10 +1062,15 @@ const QWEN_MODELS: &[QwenModelSpec] = &[
     },
     // 文档的热词支持表只在北京地域列出它（新加坡只列 fun-asr-realtime 与
     // fun-asr-realtime-2025-11-07），故保守标为北京独有。
+    //
+    // **不再在设置页列出**（listed: false）：它同样是"Fun-ASR-Realtime"，与上面
+    // 那条靠 display 里的一段后缀区分，实测中确实被误认成同一个模型。规格同样
+    // 保留——老配置里可能存着它，查不到就会按非流式处理、发到同步端点直接 400
+    // （它是 ws_realtime 模型）。
     QwenModelSpec {
         id: "fun-asr-realtime-2026-02-28",
-        display: "Fun-ASR-Realtime（2026-02-28）",
-        listed: true,
+        display: "Fun-ASR-Realtime（2026-02-28·历史）",
+        listed: false,
         ws_realtime: true,
         supports_inline_vocabulary: false,
         supports_vocabulary_id: true,
@@ -1230,15 +1235,39 @@ pub fn build_stream_params(
 /// 当前设置，默认 `http://127.0.0.1:8080`；服务未启动/模型列表为空时返回
 /// `ProviderApiError`，前端展示错误并回退为模型文本输入）。未接入模型选择
 /// 的 provider 返回空数组（前端据此隐藏模型下拉）。
+///
+/// `region_override` 是调用方（设置页表单）当前选中的地域，优先于持久化配置
+/// ——理由见 [`qwen_region_override`]。只有 qwen 用得上。
 pub async fn list_models(
     provider_id: &str,
+    region_override: Option<&str>,
     app: &tauri::AppHandle,
     http: &reqwest::Client,
 ) -> Result<Vec<ModelInfo>, AsrError> {
     match provider_id {
-        QwenAsrProvider::ID => Ok(qwen_models(qwen_region(app))),
+        // unwrap_or_else 而非 unwrap_or：被覆盖时不必白读一次磁盘配置
+        QwenAsrProvider::ID => Ok(qwen_models(
+            qwen_region_override(region_override).unwrap_or_else(|| qwen_region(app)),
+        )),
+        // llama-asr 的清单来自服务端 /v1/models，与地域无关，忽略该参数
         LlamaAsrProvider::ID => llama_models(app, http).await,
         _ => Ok(Vec::new()),
+    }
+}
+
+/// 调用方显式指定的地域。`None` = 未指定，由 [`qwen_region`] 读持久化配置。
+///
+/// **为什么需要它**：`qwen_region` 读的是**已落盘**的 settings.json，而设置页
+/// 改地域后要等 500ms debounce 才写盘，却在那之前就重拉模型（切地域要立刻刷新
+/// 列表）。不传覆盖值的话后端会按旧地域返回，列表要等下次打开设置页才更新
+/// ——表现为"切地域后少/多一个模型"，且 `ensureModelValidForRegion` 会拿着
+/// 旧清单做回退判断。传了覆盖值，清单就只取决于用户当前选的地域，与磁盘无关。
+///
+/// 空白串按"未指定"处理：调用方拿到空配置时不该把地域意外重置成默认值。
+fn qwen_region_override(region_override: Option<&str>) -> Option<DashScopeRegion> {
+    match region_override {
+        Some(r) if !r.trim().is_empty() => Some(DashScopeRegion::parse(r)),
+        _ => None,
     }
 }
 
@@ -1571,6 +1600,24 @@ mod tests {
     }
 
     #[test]
+    fn qwen_region_override_only_accepts_a_meaningful_value() {
+        // 显式传地域 → 用它（模型清单不再依赖已落盘的配置）
+        assert_eq!(
+            qwen_region_override(Some("ap-southeast-1")),
+            Some(DashScopeRegion::ApSoutheast1)
+        );
+        // 未知地域按解析规则回退默认，与别处同一套语义
+        assert_eq!(
+            qwen_region_override(Some("火星")),
+            Some(DashScopeRegion::DEFAULT)
+        );
+        // 未传 / 空白 = "未指定"，交给持久化配置，不能被误当成默认地域
+        assert_eq!(qwen_region_override(None), None);
+        assert_eq!(qwen_region_override(Some("")), None);
+        assert_eq!(qwen_region_override(Some("   ")), None);
+    }
+
+    #[test]
     fn qwen_api_key_field_is_region_scoped() {
         let fields = qwen_asr_config_fields();
         let key = fields.iter().find(|f| f.key == "api_keys").unwrap();
@@ -1659,20 +1706,42 @@ mod tests {
     }
 
     #[test]
-    fn singapore_region_excludes_cn_only_models() {
-        let cn: Vec<_> = qwen_models(DashScopeRegion::CnBeijing)
+    fn hidden_models_are_unlisted_but_still_resolvable() {
+        // 两条 Fun-ASR-Realtime 都已从设置页移除：同名不同协议，摆在一起会被
+        // 误选。但**规格必须保留**——老配置里可能存着这些名字，查不到就会按
+        // 非流式处理（流式的那个会被发到同步端点，DashScope 直接 400），
+        // 或者静默换掉同步 body 格式（fun-asr-realtime 走旧 content 格式）。
+        for id in ["fun-asr-realtime", "fun-asr-realtime-2026-02-28"] {
+            for r in DashScopeRegion::ALL.iter().copied() {
+                assert!(
+                    !qwen_models(r).iter().any(|m| m.id == id),
+                    "{id} 不该出现在地域 {} 的清单里",
+                    r.id()
+                );
+            }
+            assert!(qwen_model_spec(id).is_some(), "{id} 的规格被删了");
+        }
+        // 规格保留的实际后果：协议判定仍照表走
+        assert!(qwen_is_streaming_model("fun-asr-realtime-2026-02-28"));
+        assert!(!qwen_is_streaming_model("fun-asr-realtime"));
+        assert!(qwen_uses_legacy_audio_content("fun-asr-realtime"));
+    }
+
+    #[test]
+    fn listed_models_are_available_in_every_region() {
+        // 目前两地清单应完全一致——唯一的北京独有模型（fun-asr-realtime-2026-02-28）
+        // 已下线。将来若新增地域专属模型，这条会失败，而那正是需要停下来确认
+        // 「设置页切地域后列表会变、模型可能失效」的时刻。
+        let cn: Vec<String> = qwen_models(DashScopeRegion::CnBeijing)
             .into_iter()
             .map(|m| m.id)
             .collect();
-        let sg: Vec<_> = qwen_models(DashScopeRegion::ApSoutheast1)
+        let sg: Vec<String> = qwen_models(DashScopeRegion::ApSoutheast1)
             .into_iter()
             .map(|m| m.id)
             .collect();
-        // 文档的热词支持表只在北京列出 fun-asr-realtime-2026-02-28
-        assert!(cn.contains(&"fun-asr-realtime-2026-02-28".to_string()));
-        assert!(!sg.contains(&"fun-asr-realtime-2026-02-28".to_string()));
-        // 新接入的同步模型两地都可用
-        assert!(sg.contains(&"qwen-audio-3.0-asr-flash".to_string()));
+        assert_eq!(cn, sg, "两地模型清单不再一致");
+        assert!(cn.contains(&"qwen-audio-3.0-asr-flash".to_string()));
     }
 
     #[test]

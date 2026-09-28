@@ -81,12 +81,15 @@ export const useAsrStore = defineStore("asr", {
     /**
      * 重拉单个 provider 的模型清单（llama 换模型/重启后刷新用）。
      *
+     * `region` 传调用方当前选中的地域（见 `asrListModels`）：设置页改地域后
+     * 保存还没落盘时就重拉，不传会拿到旧地域的清单。
+     *
      * 失败时清空该 provider 的条目**并抛出**——由调用方决定怎么提示
      * （设置页要显示"模型列表拉取失败"，静默吞掉会让用户以为服务端没有模型）。
      */
-    async reloadModels(providerId: string) {
+    async reloadModels(providerId: string, region?: string) {
       try {
-        this.modelsByProvider[providerId] = await asrListModels(providerId);
+        this.modelsByProvider[providerId] = await asrListModels(providerId, region);
       } catch (e) {
         this.modelsByProvider[providerId] = [];
         throw e;
