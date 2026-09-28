@@ -14,6 +14,14 @@ export interface BubbleMirror {
   subtitle: string;
   emotion: string;
   motionText: string;
+  /**
+   * 当前角色语音（`uiStore.currentAvatarAudio`）。
+   *
+   * 气泡窗不跑事件处理器（main.ts 里 `window=bubble` 不注册 `initializeTauriEventListeners`），
+   * 该字段在本窗口恒为默认值 `"None"` —— 于是气泡里的打字机读不到「这句有语音」，
+   * 打字音效就会在角色语音同时播放。必须随台词一起镜像过来。
+   */
+  avatarAudio: string;
   /** 打字速度（来自 settings.textSpeed，气泡窗的 uiStore 是只读派生，故直接镜像设置值） */
   textSpeed: number;
   /** 桌宠缩放。气泡窗的窗口尺寸由 Rust 按它创建，CSS 缩放必须用同一个值 ——
@@ -37,3 +45,19 @@ export type BubbleAlign = "top" | "bottom";
 
 export const PET_BUBBLE_EVENT = "pet:bubble-mirror";
 export const PET_BUBBLE_REQUEST = "pet:bubble-request";
+
+/**
+ * 气泡窗 → 宠物窗：气泡内打字机的打字状态变化。
+ *
+ * 打字机动效绑在气泡窗的 DOM 上（DialogueBox 在 BubbleWindow 里），而自动推进调度器
+ * 在宠物窗（事件队列、语音、AUTO 开关都在那边），跨窗口拿不到组件的响应式 ref，
+ * 只能由气泡窗把 `isTyping` 广播回去。没有它，宠物窗会以为「永远不在打字」，
+ * 自动推进要么抢跑（打字没完就跳下一句）要么根本不推进。
+ */
+export const PET_BUBBLE_TYPING_EVENT = "pet:bubble-typing";
+
+/**
+ * 宠物窗 → 气泡窗：请求补全当前打字动画（点击头像则先补全文本、不推进队列），
+ * 与主界面 GameDialog 点击时先 `finishTyping` 的语义一致。
+ */
+export const PET_FINISH_TYPING_EVENT = "pet:finish-typing";

@@ -87,7 +87,7 @@ const props = defineProps<{
   align?: BubbleAlign;
 }>();
 
-const emit = defineEmits<{ advance: []; drained: [] }>();
+const emit = defineEmits<{ advance: []; drained: []; "typing-change": [typing: boolean] }>();
 
 const side = computed<BubbleSide>(() => props.side ?? "above");
 /** 左右置：版式整体转 90° —— 贴窗口左右边、长尾水平指向宠物、内容纵向贴上/下边 */
@@ -183,6 +183,10 @@ const { startTyping, stopTyping, finishTyping, isTyping } = useTypeWriter(
   charReveal.writeFn,
 );
 
+// 打字状态广播给父级（BubbleWindow 再转报宠物窗）——自动推进调度器在宠物窗，
+// 跨窗口拿不到本组件的响应式 ref，只能靠事件同步，否则桌宠的自动推进看不到打字机。
+watch(isTyping, (typing) => emit("typing-change", typing), { immediate: true });
+
 /**
  * 去重与"重播"判据。
  *
@@ -263,6 +267,9 @@ const render = async (line: string, instant: boolean) => {
     displayEmpty.value = false;
     shownLine.value = line;
     emit("drained");
+    // 整段复现不经过打字机，isTyping 从头到尾都是 false，上面那条 watch 不会触发 ——
+    // 必须显式回报一次，否则宠物窗会一直等一个不会来的「打字结束」，自动推进卡死
+    emit("typing-change", false);
     return;
   }
 

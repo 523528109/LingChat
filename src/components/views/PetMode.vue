@@ -49,7 +49,7 @@ import { useGameStore } from "@/stores/modules/game";
 import { useSettingsStore } from "@/stores/modules/settings";
 import { useUIStore } from "@/stores/modules/ui/ui";
 import { useAutoAdvance } from "@/composables/chat/useAutoAdvance";
-import { eventQueue } from "@/core/events/event-queue";
+import { useDialogAdvance } from "@/composables/chat/useDialogAdvance";
 
 import ChatInput from "../pet/ChatInput.vue";
 import DragArea from "../pet/DragArea.vue";
@@ -67,6 +67,8 @@ import {
 import {
   PET_BUBBLE_EVENT,
   PET_BUBBLE_REQUEST,
+  PET_BUBBLE_TYPING_EVENT,
+  PET_FINISH_TYPING_EVENT,
   type BubbleAlign,
   type BubbleMirror,
   type BubbleSide,
@@ -80,6 +82,15 @@ const uiStore = useUIStore();
 
 const showChatInput = ref(false);
 const { isDragging } = useFileDrop();
+
+/**
+ * 气泡内打字机的打字状态（由气泡窗广播回来）。
+ *
+ * 桌宠重构后打字机随 DialogueBox 搬进了独立的 BubbleWindow，而自动推进调度器
+ * （事件队列 / 语音 / AUTO 开关）仍在宠物窗，跨窗口拿不到组件 ref，只能靠
+ * `pet:bubble-typing` 事件同步——否则调度器以为永远不在打字，自动对话直接失效。
+ */
+const bubbleTyping = ref(false);
 
 const avatarContainer = ref<HTMLElement | null>(null);
 const chatContainer = ref<HTMLElement | null>(null);
@@ -112,6 +123,9 @@ const emitMirror = () => {
     emotion: uiStore.showCharacterEmotion,
     motionText: uiStore.showCharacterMotionText,
     textSpeed: uiStore.typeWriterSpeed,
+    // 语音字段必须镜像：气泡里的打字机据此决定是否播打字音效（见 TypeWriter.playRandomSound），
+    // 气泡窗不跑事件处理器，不镜像就恒为 "None" → 有角色语音时也会播打字机音效。
+    avatarAudio: uiStore.currentAvatarAudio,
     petScale: scale.value,
     bubbleSide: mirroredSide.value,
     bubbleAlign: mirroredAlign.value,
@@ -383,6 +397,10 @@ onMounted(async () => {
       const { x, y } = event.payload;
       setShowChatInput(x >= 0 && y >= 0 && x <= window.innerWidth && y <= window.innerHeight);
     }),
+    // 气泡窗的打字状态（自动推进调度器要用它判断打字机是否已结束）
+    await appWindow.listen<{ typing: boolean }>(PET_BUBBLE_TYPING_EVENT, (event) => {
+      onBubbleTyping(Boolean(event.payload?.typing));
+    }),
   );
 
   await applyWindowLayout();
@@ -413,6 +431,7 @@ watch(
   () => [
     uiStore.showCharacterLine,
     uiStore.showCharacterEmotion,
+    uiStore.currentAvatarAudio,
     gameStore.currentStatus,
     uiStore.notification.isVisible,
     uiStore.notification.message,
@@ -431,8 +450,67 @@ const setShowChatInput = (insideWindow: boolean) => {
 const handleMouseEnter = () => setShowChatInput(true);
 const handleMouseLeave = () => setShowChatInput(false);
 
-/** 推进对话：气泡在另一个窗口，故直接驱动事件队列 */
-const handleAvatarClick = () => eventQueue.continue();
+/** 补全气泡里的打字动画（点击推进时先补全文本、不推进，与主界面一致） */
+const requestFinishTyping = () => {
+  void appWindow.emitTo("pet_bubble", PET_FINISH_TYPING_EVENT);
+};
+
+/**
+ * 推进状态机 —— 与主界面 GameDialog 共用 `useDialogAdvance`。
+ *
+ * 打字机在气泡窗，`isTyping` 用镜像回来的 `bubbleTyping`，`finishTyping`
+ * 通过事件让气泡窗补全 —— 桌宠无动作文本（两段式），故不传 `motion`。
+ */
+const { continueDialog } = useDialogAdvance({
+  isTyping: computed(() => bubbleTyping.value),
+  finishTyping: requestFinishTyping,
+});
+
+const {
+  typingFinished,
+  onAudioStarted: handleAudioStarted,
+  onAudioFinished: handleAudioFinished,
+  manualTriggerContinue,
+  cancelAdvance,
+  scheduleAdvance,
+  toggleAutoMode: handleSwitchAutoMode,
+} = useAutoAdvance({
+  // 气泡窗只有一个受控的显示组件，没有组件句柄：用镜像的 isTyping + 共用状态机拼一个
+  dialog: () => ({ isTyping: bubbleTyping.value, continueDialog }),
+  mergeEnabled: false,
+});
+
+/**
+ * 新台词到达：先按「还在打字」压住调度器，等气泡窗回报真实状态再放行。
+ *
+ * 主界面同窗口，`isTyping` 在定时器触发前必定已更新；桌宠的打字机在另一个 webview，
+ * 状态要过一趟 IPC 才回来。若沿用主界面「先按未打字调度」，autoAdvanceDelay 很小时
+ * 定时器会抢在气泡回报之前触发 —— 台词还没打完就跳下一句。
+ * 非空台词必定触发气泡重画，气泡要么回报 true（开始打字）、要么回报 false
+ * （整段复现），所以只在空台词（无气泡可画）时跳过，避免等一个不会来的回报。
+ */
+watch(
+  () => uiStore.showCharacterLine,
+  (line) => {
+    if (!line) return;
+    typingFinished.value = false;
+    cancelAdvance();
+  },
+);
+
+/** 气泡窗回报打字状态：显式写回调度器（整段复现时 isTyping 不变，内部 watch 不触发） */
+const onBubbleTyping = (typing: boolean) => {
+  bubbleTyping.value = typing;
+  typingFinished.value = !typing;
+  if (typing) cancelAdvance();
+  else scheduleAdvance();
+};
+
+/** 推进对话：先取消待调度，再走共用状态机（打字中先补全、不推进） */
+const handleAvatarClick = () => {
+  manualTriggerContinue();
+  continueDialog(true);
+};
 
 const handleOpenSettings = async () => {
   try {
@@ -458,12 +536,7 @@ const handleOpenSettings = async () => {
   }
 };
 
-// 自动推进与语音收尾仍在本窗口调度；气泡是显示层，故没有对话组件句柄
-const {
-  onAudioStarted: handleAudioStarted,
-  onAudioFinished: handleAudioFinished,
-  toggleAutoMode: handleSwitchAutoMode,
-} = useAutoAdvance({ dialog: () => null, mergeEnabled: false });
+// 自动推进与语音收尾仍在本窗口调度；对话框句柄由镜像的打字状态拼出（见上）
 
 const handleExitPetMode = async () => {
   try {

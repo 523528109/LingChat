@@ -20,6 +20,7 @@
       :max-height="bubbleMaxHeight"
       :side="side"
       :align="align"
+      @typing-change="onTypingChange"
     />
   </div>
 </template>
@@ -34,6 +35,8 @@ import DialogueBox from "../pet/DialogueBox.vue";
 import {
   PET_BUBBLE_EVENT,
   PET_BUBBLE_REQUEST,
+  PET_BUBBLE_TYPING_EVENT,
+  PET_FINISH_TYPING_EVENT,
   type BubbleAlign,
   type BubbleMirror,
   type BubbleSide,
@@ -50,7 +53,6 @@ const uiStore = useUIStore();
 const gameStore = useGameStore();
 
 const dialogRef = ref<InstanceType<typeof DialogueBox> | null>(null);
-void dialogRef;
 
 /**
  * 是否整段显示、不播打字机。
@@ -147,11 +149,23 @@ const applyMirror = (m: BubbleMirror) => {
   uiStore.showCharacterSubtitle = m.subtitle;
   uiStore.showCharacterEmotion = m.emotion;
   uiStore.showCharacterMotionText = m.motionText;
+  // 语音字段必须镜像：气泡里的打字机读它决定是否播打字音效（见 TypeWriter.playRandomSound），
+  // 而本窗口不跑事件处理器，不镜像就恒为 "None" → 有语音时也播。
+  uiStore.currentAvatarAudio = m.avatarAudio ?? "None";
   settingsStore.setTextSpeed(m.textSpeed);
   uiStore.notification = m.notification as typeof uiStore.notification;
 };
 
+/**
+ * 打字状态转发给宠物窗：自动推进调度器在那边（事件队列/语音/AUTO 开关都在宠物窗），
+ * 气泡窗只负责画，自己跑不了状态机。
+ */
+const onTypingChange = (typing: boolean) => {
+  void getCurrentWindow().emitTo("main", PET_BUBBLE_TYPING_EVENT, { typing });
+};
+
 let unlisten: (() => void) | null = null;
+let unlistenFinish: (() => void) | null = null;
 const pingTimers: number[] = [];
 
 onMounted(async () => {
@@ -161,6 +175,10 @@ onMounted(async () => {
 
   unlisten = await appWindow.listen<BubbleMirror>(PET_BUBBLE_EVENT, (event) =>
     applyMirror(event.payload),
+  );
+  // 宠物窗推进时若气泡还在打字，先补全文本（跨窗口不能直调组件方法）
+  unlistenFinish = await appWindow.listen(PET_FINISH_TYPING_EVENT, () =>
+    dialogRef.value?.finishTyping(),
   );
 
   // 握手重试：气泡窗创建早于宠物窗注册监听时，第一次请求会石沉大海，
@@ -178,6 +196,8 @@ onUnmounted(() => {
   document.documentElement.style.backgroundColor = "";
   unlisten?.();
   unlisten = null;
+  unlistenFinish?.();
+  unlistenFinish = null;
   pingTimers.forEach((t) => window.clearTimeout(t));
 });
 </script>
