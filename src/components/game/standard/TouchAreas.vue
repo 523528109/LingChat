@@ -217,7 +217,20 @@ const findClickedPart = (clientX: number, clientY: number): BodyPart | null => {
 };
 
 // 处理多边形点击
+//
+// 触摸模式下的点击行为整体停用：抚摸改由 Live2D 舞台接管，这里不再发送
+// 「XX戳了一下你」，也不再靠点击推进对话队列，下面第二击那段同属该分支。
+//
+// 用常量而不是直接删掉，是因为这段逻辑是 TouchAreas 后续重构的输入，多边形与
+// 发光提示在静态立绘角色上仍然保留。重构时应连同下面的命中判定一起重做，
+// 而不是把这个开关翻回 true。
+const TOUCH_CLICK_SENDS_MESSAGE = false;
+
 const handlePolygonClick = (event: MouseEvent) => {
+  if (!TOUCH_CLICK_SENDS_MESSAGE) {
+    return;
+  }
+
   if (gameStore.command !== "touch") {
     return;
   }

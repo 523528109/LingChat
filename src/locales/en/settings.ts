@@ -503,6 +503,14 @@ export default {
       noExpression: "Do Not Change Expression",
       noMotion: "Do Not Play Motion",
       clothesMapping: "Outfit to Model Variant Mapping",
+      touchReactions: "Touch Reactions",
+      touchHint:
+        "Tick a part to make it strokable in the touch mode of the main chat: the head leans with your hand, and the expression and motion bound here play once your hand stops. Leave either blank to just get the lean.",
+      touchPart_head: "Head",
+      touchPart_body: "Body",
+      touchPart_legs: "Legs",
+      touchPart_earLeft: "Left Ear",
+      touchPart_earRight: "Right Ear",
     },
     footer: {
       cancel: "Cancel",

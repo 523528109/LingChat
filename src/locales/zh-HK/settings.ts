@@ -471,6 +471,14 @@ export default {
       noExpression: "唔切換表情",
       noMotion: "唔播放動作",
       clothesMapping: "服裝同模型變體對應",
+      touchReactions: "撫摸反應",
+      touchHint:
+        "揀咗部位之後，主對話嘅觸摸模式入面撫摸佢就會有反應：個頭會跟住你隻手嘅方向輕輕擺，手停低就播呢度綁嘅表情同動作。兩樣都可以留空，留空就淨係擺。",
+      touchPart_head: "頭部",
+      touchPart_body: "身體",
+      touchPart_legs: "雙腿",
+      touchPart_earLeft: "左耳",
+      touchPart_earRight: "右耳",
     },
     footer: {
       cancel: "取消",

@@ -509,6 +509,7 @@ fn inspect_model(
             gain: 1.0,
             extra: HashMap::new(),
         }),
+        touch_motions: HashMap::new(),
         extra: HashMap::new(),
     };
     Ok((
@@ -541,23 +542,24 @@ fn unique_variant_name(model_file: &Path, existing: &HashMap<String, Live2dVaria
     unreachable!()
 }
 
+/// 校验一条动作绑定指向的动作确实存在。
+///
+/// 取 group/index 而不是收结构体引用，是因为抚摸绑定与情绪绑定是各自独立的结构体，
+/// 收结构体的话两边就得各写一份同样的校验。
 fn validate_motion_binding(
     variant_name: &str,
     label: &str,
-    binding: &Live2dMotionBinding,
+    group: &str,
+    index: usize,
     info: &Live2dModelInfo,
 ) -> Result<(), String> {
-    let files = info.motions.get(&binding.group).ok_or_else(|| {
-        format!(
-            "variant {variant_name} 的 {label} 引用了不存在的动作组 {}",
-            binding.group
-        )
-    })?;
-    if binding.index >= files.len() {
+    let files = info
+        .motions
+        .get(group)
+        .ok_or_else(|| format!("variant {variant_name} 的 {label} 引用了不存在的动作组 {group}"))?;
+    if index >= files.len() {
         return Err(format!(
-            "variant {variant_name} 的 {label} 动作索引 {} 越界（组 {} 共 {} 个）",
-            binding.index,
-            binding.group,
+            "variant {variant_name} 的 {label} 动作索引 {index} 越界（组 {group} 共 {} 个）",
             files.len()
         ));
     }
@@ -595,10 +597,37 @@ fn validate_variant_bindings(
         }
     }
     if let Some(idle) = &variant.idle {
-        validate_motion_binding(variant_name, "idle", idle, info)?;
+        validate_motion_binding(variant_name, "idle", &idle.group, idle.index, info)?;
     }
     for (emotion, motion) in &variant.motions {
-        validate_motion_binding(variant_name, &format!("情绪 {emotion}"), motion, info)?;
+        validate_motion_binding(
+            variant_name,
+            &format!("情绪 {emotion}"),
+            &motion.group,
+            motion.index,
+            info,
+        )?;
+    }
+    for (part, binding) in &variant.touch_motions {
+        if let Some(expression) = &binding.expression {
+            if !info.expressions.contains(expression) {
+                return Err(format!(
+                    "variant {variant_name} 的抚摸 {part} 引用了不存在的表情: {expression}"
+                ));
+            }
+        }
+        match (&binding.group, binding.index) {
+            (Some(group), Some(index)) => {
+                validate_motion_binding(variant_name, &format!("抚摸 {part}"), group, index, info)?;
+            },
+            // 只晃动不播动作，是合法的
+            (None, None) => {},
+            _ => {
+                return Err(format!(
+                    "variant {variant_name} 的抚摸 {part} 必须同时给出 group 与 index，只给其中一个不会播任何动作"
+                ));
+            },
+        }
     }
     Ok(())
 }

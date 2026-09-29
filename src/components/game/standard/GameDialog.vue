@@ -65,7 +65,6 @@
                     :title="$t('game.dialog.sceneSettings')"
                     @click="openSceneSettings"
                   ></Button>
-                  <!--
                   <Button
                     type="nav"
                     icon="hand"
@@ -73,7 +72,6 @@
                     @click="toggleTouchMode"
                     @contextmenu.prevent="exitTouchMode"
                   ></Button>
-                  -->
                   <Button
                     type="nav"
                     icon="history"

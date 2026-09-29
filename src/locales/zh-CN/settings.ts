@@ -509,6 +509,14 @@ export default {
       noExpression: "不切换表情",
       noMotion: "不播放动作",
       clothesMapping: "服装与模型变体映射",
+      touchReactions: "抚摸反应",
+      touchHint:
+        "勾选部位后，主对话的触摸模式里抚摸它就会有反应：头随手的移动方向轻晃，手停下后播放这里绑定的表情与动作。两者都可留空，留空就只晃动。",
+      touchPart_head: "头部",
+      touchPart_body: "身体",
+      touchPart_legs: "双腿",
+      touchPart_earLeft: "左耳",
+      touchPart_earRight: "右耳",
     },
     footer: {
       cancel: "取消",

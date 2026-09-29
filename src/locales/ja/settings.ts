@@ -484,6 +484,14 @@ export default {
       noExpression: "表情を変更しない",
       noMotion: "モーションを再生しない",
       clothesMapping: "衣装とモデルバリアントの対応",
+      touchReactions: "なでられリアクション",
+      touchHint:
+        "部位にチェックを入れると、メイン会話のタッチモードでそこをなでたときに反応します。頭が手の動きに合わせて傾き、手を止めるとここで設定した表情とモーションが再生されます。どちらも空欄なら傾くだけになります。",
+      touchPart_head: "頭",
+      touchPart_body: "体",
+      touchPart_legs: "脚",
+      touchPart_earLeft: "左耳",
+      touchPart_earRight: "右耳",
     },
     footer: {
       cancel: "キャンセル",
