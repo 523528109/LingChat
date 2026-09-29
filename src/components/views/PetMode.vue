@@ -61,11 +61,13 @@ import {
 import {
   PET_BUBBLE_EVENT,
   PET_BUBBLE_REQUEST,
-  PET_BUBBLE_TYPING_EVENT,
   PET_FINISH_TYPING_EVENT,
+  PET_LINE_DRAINED,
+  nextLineId,
   type BubbleAlign,
   type BubbleMirror,
   type BubbleSide,
+  type LineDrainedPayload,
 } from "../pet/bubbleMirror";
 
 const { t } = useI18n();
@@ -77,8 +79,15 @@ const uiStore = useUIStore();
 const showChatInput = ref(false);
 const { isDragging } = useFileDrop();
 
-// 气泡窗（另一 webview）里的打字状态，由 pet:bubble-typing 广播回来
-const bubbleTyping = ref(false);
+/**
+ * 「当前这句吐完了没有」——不镜像气泡窗的打字机状态，而是本地相减得出。
+ *
+ * 打字机在气泡窗，跨窗口读一个会变的布尔量只能靠变化边沿，丢一次就永久失联。
+ * 改成气泡窗上报「第 N 句已完整显示」：未上报的当前句即视为还在打字。
+ */
+const currentLineId = ref(nextLineId());
+const drainedLineId = ref(currentLineId.value);
+const lineTyping = computed(() => drainedLineId.value !== currentLineId.value);
 
 const avatarContainer = ref<HTMLElement | null>(null);
 const chatContainer = ref<HTMLElement | null>(null);
@@ -99,10 +108,23 @@ const PET_BUBBLE_SIDE_EVENT = "pet-bubble-side-changed";
 
 const appWindow = getCurrentWindow();
 
+/** 上一次镜像出去的台词，用于判断「这是新的一句」——见 emitMirror 里的发号 */
+let lastMirroredLine = "";
+
 const emitMirror = () => {
+  const line = uiStore.showCharacterLine;
+  // 惰性发号：只能在镜像处推进，放独立 watch 里会因注册顺序让本次 mirror 带上上一句的号
+  if (line.trim() !== "" && line !== lastMirroredLine) {
+    lastMirroredLine = line;
+    currentLineId.value = nextLineId();
+    // 新句立刻压住调度：气泡那边的完成信号要跨进程绕一圈才回来
+    typingFinished.value = false;
+    cancelAdvance();
+  }
   const payload: BubbleMirror = {
     status: gameStore.currentStatus,
-    line: uiStore.showCharacterLine,
+    line,
+    lineId: currentLineId.value,
     title: uiStore.showCharacterTitle,
     subtitle: uiStore.showCharacterSubtitle,
     emotion: uiStore.showCharacterEmotion,
@@ -372,8 +394,9 @@ onMounted(async () => {
       const { x, y } = event.payload;
       setShowChatInput(x >= 0 && y >= 0 && x <= window.innerWidth && y <= window.innerHeight);
     }),
-    await appWindow.listen<{ typing: boolean }>(PET_BUBBLE_TYPING_EVENT, (event) => {
-      onBubbleTyping(Boolean(event.payload?.typing));
+    // 气泡窗回报「第 N 句已完整显示」
+    await appWindow.listen<LineDrainedPayload>(PET_LINE_DRAINED, (event) => {
+      onLineDrained(Number(event.payload?.lineId));
     }),
   );
 
@@ -425,7 +448,7 @@ const requestFinishTyping = () => {
 };
 
 const { continueDialog } = useDialogAdvance({
-  isTyping: computed(() => bubbleTyping.value),
+  isTyping: lineTyping,
   finishTyping: requestFinishTyping,
 });
 
@@ -438,27 +461,23 @@ const {
   scheduleAdvance,
   toggleAutoMode: handleSwitchAutoMode,
 } = useAutoAdvance({
-  // 打字机在气泡窗，没有组件句柄：用镜像的 isTyping + 共用状态机拼一个
-  dialog: () => ({ isTyping: bubbleTyping.value, continueDialog }),
+  // 打字机在气泡窗，没有组件句柄：用本地派生的 isTyping + 共用状态机拼一个
+  dialog: () => ({ isTyping: lineTyping.value, continueDialog }),
   mergeEnabled: false,
 });
 
-// 新台词：先按「还在打字」压住自动推进，等气泡回报真实状态再放行
-watch(
-  () => uiStore.showCharacterLine,
-  (line) => {
-    if (!line) return;
-    typingFinished.value = false;
-    cancelAdvance();
-  },
-);
-
-// 显式写回调度器：整段复现时 isTyping 不变，内部 watch 不会触发
-const onBubbleTyping = (typing: boolean) => {
-  bubbleTyping.value = typing;
-  typingFinished.value = !typing;
-  if (typing) cancelAdvance();
-  else scheduleAdvance();
+/**
+ * 气泡窗回报「第 N 句已完整显示」。
+ *
+ * 只认当前这句的号，过期或超前的回报一律丢弃；同一句重复回报（重新显示、清屏补发）
+ * 不再重排延迟，否则延时会被无限续期。
+ */
+const onLineDrained = (drainedId: number) => {
+  if (!Number.isFinite(drainedId) || drainedId !== currentLineId.value) return;
+  if (drainedLineId.value === drainedId) return;
+  drainedLineId.value = drainedId;
+  typingFinished.value = true;
+  scheduleAdvance();
 };
 
 // 先取消待调度，再走共用状态机（打字中先补全文字、不推进）

@@ -25,7 +25,7 @@
 
       <div
         ref="textRef"
-        class="dialog-text-lock [scrollbar-width:none] overflow-y-auto pb-[0.4em] text-[calc(15px*var(--pet-ui-scale,1))] leading-snug font-medium break-all whitespace-pre-line [text-shadow:0_0_3px_rgba(0,0,0,0.9),0_1px_4px_rgba(0,0,0,0.5)] [&::-webkit-scrollbar]:hidden"
+        class="dialog-text-lock overflow-y-auto pb-[0.4em] text-[calc(15px*var(--pet-ui-scale,1))] leading-snug font-medium break-all whitespace-pre-line [text-shadow:0_0_3px_rgba(0,0,0,0.9),0_1px_4px_rgba(0,0,0,0.5)] [&::-webkit-scrollbar]:hidden"
       ></div>
 
       <div class="absolute h-0 w-0 drop-shadow-md" :class="tailOuterClass"></div>
@@ -53,6 +53,8 @@ import PetNotification from "./PetNotification.vue";
 const props = defineProps<{
   visible: boolean;
   line: string;
+  /** 台词序号，由宠物窗随镜像一起发下来；drained 时原样回传，用于区分是哪一句 */
+  lineId: number;
   emotion?: string;
   speed?: number;
   instant?: boolean;
@@ -62,7 +64,7 @@ const props = defineProps<{
   alignInset?: number;
 }>();
 
-const emit = defineEmits<{ advance: []; drained: []; "typing-change": [typing: boolean] }>();
+const emit = defineEmits<{ advance: []; drained: [lineId: number] }>();
 
 const side = computed<BubbleSide>(() => props.side ?? "above");
 const horizontal = computed(() => side.value === "left" || side.value === "right");
@@ -134,8 +136,6 @@ const { startTyping, stopTyping, finishTyping, isTyping } = useTypeWriter(
   charReveal.writeFn,
 );
 
-watch(isTyping, (typing) => emit("typing-change", typing), { immediate: true });
-
 const displayEmpty = ref(true);
 const shownLine = ref<string | null>(null);
 
@@ -171,6 +171,8 @@ const clearDisplay = () => {
 
 const render = async (line: string, instant: boolean) => {
   const token = ++renderToken;
+  // 和 token 一起捕获：完成信号必须属于本次渲染的那一句，emit 时再读 props.lineId 会串号
+  const id = props.lineId;
 
   stopTyping();
   if (textRef.value) {
@@ -185,8 +187,7 @@ const render = async (line: string, instant: boolean) => {
     if (textRef.value) charReveal.renderInstant(textRef.value, line);
     displayEmpty.value = false;
     shownLine.value = line;
-    emit("drained");
-    emit("typing-change", false);
+    emit("drained", id);
     return;
   }
 
@@ -194,17 +195,22 @@ const render = async (line: string, instant: boolean) => {
   if (token !== renderToken) return;
   displayEmpty.value = false;
   shownLine.value = line;
-  if (!isTyping.value) emit("drained");
+  // 自然打完或被 finishTyping 补全（TypeWriter.finish 会收口 start 的 promise）；过期渲染已被 token 挡掉
+  if (!isTyping.value) emit("drained", id);
 };
 
 watch(
   () => [props.visible, props.line, props.instant] as const,
   ([visible, line, instant], prev) => {
-    if (!visible || !line) {
+    // 台词清空才丢弃显示内容。drained 只代表「这一句完整显示过」，
+    // 隐藏（状态切走）不是结束，更不能上报——否则宠物窗会把它当成能推进的信号。
+    if (!line) {
       renderToken++;
       clearDisplay();
       return;
     }
+    // 只是隐藏：显示内容与进度原样留着，视觉效果由 CSS 淡出负责
+    if (!visible) return;
 
     const sameLine = shownLine.value === line;
     const stillShown = prev?.[0] === true && !displayEmpty.value;

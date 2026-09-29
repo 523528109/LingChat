@@ -9,6 +9,7 @@
       ref="dialogRef"
       :visible="bubbleVisible"
       :line="uiStore.showCharacterLine"
+      :line-id="lineId"
       :emotion="uiStore.showCharacterEmotion"
       :speed="uiStore.typeWriterSpeed"
       :instant="instant"
@@ -16,7 +17,7 @@
       :side="side"
       :align="align"
       :align-inset="alignInset"
-      @typing-change="onTypingChange"
+      @drained="onLineDrained"
     />
   </div>
 </template>
@@ -31,8 +32,8 @@ import DialogueBox from "../pet/DialogueBox.vue";
 import {
   PET_BUBBLE_EVENT,
   PET_BUBBLE_REQUEST,
-  PET_BUBBLE_TYPING_EVENT,
   PET_FINISH_TYPING_EVENT,
+  PET_LINE_DRAINED,
   type BubbleAlign,
   type BubbleMirror,
   type BubbleSide,
@@ -49,6 +50,9 @@ const uiStore = useUIStore();
 const gameStore = useGameStore();
 
 const dialogRef = ref<InstanceType<typeof DialogueBox> | null>(null);
+
+/** 当前这句台词的序号（宠物窗发号），随 drained 原样回传 */
+const lineId = ref(0);
 
 const instant = ref(true);
 let firstLineSeen = false;
@@ -109,6 +113,8 @@ const applyMirror = (m: BubbleMirror) => {
     instant.value = false;
   }
   gameStore.currentStatus = m.status as typeof gameStore.currentStatus;
+  // 先写号再写台词：渲染 watch 是 post-flush，读到的号必须是这一句的
+  lineId.value = Number(m.lineId) || 0;
   uiStore.showCharacterLine = m.line;
   uiStore.showCharacterTitle = m.title;
   uiStore.showCharacterSubtitle = m.subtitle;
@@ -119,8 +125,12 @@ const applyMirror = (m: BubbleMirror) => {
   uiStore.notification = m.notification as typeof uiStore.notification;
 };
 
-const onTypingChange = (typing: boolean) => {
-  void getCurrentWindow().emitTo("main", PET_BUBBLE_TYPING_EVENT, { typing });
+/**
+ * 「本句已完整显示」上报给宠物窗：自动推进调度器在那边（事件队列、语音、AUTO 开关
+ * 都在宠物窗）。只报这一句的序号，不报任何「在不在打字」的状态。
+ */
+const onLineDrained = (drainedLineId: number) => {
+  void getCurrentWindow().emitTo("main", PET_LINE_DRAINED, { lineId: drainedLineId });
 };
 
 let unlisten: (() => void) | null = null;
