@@ -686,6 +686,7 @@ export default {
       fav: "收藏（移到最前）",
       unfav: "取消收藏",
       categoryAll: "全部",
+      categoryEmpty: "此分類暫無場景，可上傳背景或將現有場景移至此分類",
       categoryNameEmpty: "請輸入分類名稱",
       categoryNamePlaceholder: "新分類名",
       categoryAdd: "新建分類",

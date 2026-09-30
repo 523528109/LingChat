@@ -702,6 +702,8 @@ export default {
       fav: "お気に入り（先頭へ移動）",
       unfav: "お気に入りを解除",
       categoryAll: "すべて",
+      categoryEmpty:
+        "このカテゴリにはシーンがありません。背景をアップロードするか、既存のシーンを移動してください。",
       categoryNameEmpty: "カテゴリ名を入力してください",
       categoryNamePlaceholder: "新カテゴリ名",
       categoryAdd: "カテゴリを追加",
