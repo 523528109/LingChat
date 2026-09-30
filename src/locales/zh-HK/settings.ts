@@ -1351,8 +1351,8 @@ export default {
     streamModeHintLocal: "錄音結束後上傳本地識別，結果逐步顯示（llama-server 結果串流）",
     streamNotSupported: "目前模型唔支援串流識別",
     provider: {
-      title: "語音識別服務商",
-      providerSelect: "服務商",
+      title: "語音識別服務",
+      providerSelect: "服務",
       modelRefresh: "重新載入模型列表",
       modelListFailed: "獲取模型列表失敗：{err}",
       test: "測試連接",

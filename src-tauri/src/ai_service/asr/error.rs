@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use serde::Serialize;
+use tracing::warn;
 
 #[derive(Debug, thiserror::Error, Serialize, Clone)]
 #[serde(tag = "code", content = "data")]
@@ -59,6 +60,29 @@ impl AsrError {
             Self::Canceled => "ASR_CANCELED",
             Self::MicPermissionDenied => "ASR_MIC_DENIED",
             Self::StreamingNotSupported(_) => "ASR_STREAMING_UNSUPPORTED",
+        }
+    }
+}
+
+// ============================================================================
+// reqwest 错误映射
+// ============================================================================
+
+///
+/// reqwest 的网络/超时/协议错误统一归类为 provider 错误；上层无需关心细节。
+pub(crate) fn map_reqwest_error(e: reqwest::Error) -> AsrError {
+    if e.is_timeout() {
+        AsrError::ProviderTimeout("network".into())
+    } else if e.is_connect() || e.is_request() {
+        AsrError::ProviderApiError {
+            provider: "network".into(),
+            message: format!("请求失败: {e}"),
+        }
+    } else {
+        warn!("reqwest 错误: {e}");
+        AsrError::ProviderApiError {
+            provider: "network".into(),
+            message: format!("{e}"),
         }
     }
 }

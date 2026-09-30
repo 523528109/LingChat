@@ -23,7 +23,7 @@ use reqwest::multipart::Form;
 use std::sync::Arc;
 use tracing::debug;
 
-use super::error::AsrError;
+use super::error::{AsrError, map_reqwest_error};
 use super::provider::{AsrResult, ProviderCredentials, parse_llama_text};
 
 /// SSE 帧解析结果。
@@ -84,13 +84,16 @@ fn extract_lines(buf: &mut Vec<u8>) -> Vec<String> {
 /// - 每个 partial 以累积完整文本经 `on_partial` 回调发射（`parse_llama_text`
 ///   切 `<asr_text>` 取文本，与整句识别同一解析）——事件发射由调用方负责
 ///   （session / 命令层注入回调），本模块不依赖 Tauri AppHandle
-/// - 热词接口复用：`cred.hotwords` 非空时带 `prompt` 字段
+/// - 热词接口复用：`prompt` 非空时带 `prompt` 字段。偏置文本的构造（去重、
+///   长度上限）是 provider 的策略，本模块只负责发送——保持「通用 SSE 客户端」
+///   的定位，不依赖热词的具体形态
 /// - 无 `[DONE]` 正常断开时以最后一条 partial 为 final
 pub async fn recognize_stream(
     http: &reqwest::Client,
     cred: &ProviderCredentials,
     endpoint: &str,
     model: &str,
+    prompt: Option<String>,
     wav_bytes: Vec<u8>,
     on_partial: Option<Arc<dyn for<'a> Fn(&'a str) + Send + Sync + 'static>>,
 ) -> Result<AsrResult, AsrError> {
@@ -111,9 +114,14 @@ pub async fn recognize_stream(
                     message: format!("构造 multipart 失败: {e}"),
                 })?,
         );
-    // 热词接口：extra["hotwords"] 非空时作为 prompt 上下文偏置（与整句一致）
-    if !cred.hotwords.is_empty() {
-        form = form.text("prompt", cred.hotwords.join(", "));
+    // 热词接口：prompt 上下文偏置（与整句识别同一构造，见
+    // provider::llama_prompt_from_hotwords）
+    if let Some(p) = prompt {
+        debug!(
+            "[ASR/llama-stream] prompt 偏置（{} 字符）: {p}",
+            p.chars().count()
+        );
+        form = form.text("prompt", p);
     }
 
     let mut req = http.post(&url).multipart(form);
@@ -192,24 +200,6 @@ pub async fn recognize_stream(
         confidence: None,
         provider_id: "llama-asr".into(),
     })
-}
-
-/// 把 `reqwest::Error` 映射成 [`AsrError`]（与 provider.rs 同款）。
-fn map_reqwest_error(e: reqwest::Error) -> AsrError {
-    if e.is_timeout() {
-        AsrError::ProviderTimeout("network".into())
-    } else if e.is_connect() || e.is_request() {
-        AsrError::ProviderApiError {
-            provider: "network".into(),
-            message: format!("请求失败: {e}"),
-        }
-    } else {
-        tracing::warn!("reqwest 错误: {e}");
-        AsrError::ProviderApiError {
-            provider: "network".into(),
-            message: format!("{e}"),
-        }
-    }
 }
 
 #[cfg(test)]
