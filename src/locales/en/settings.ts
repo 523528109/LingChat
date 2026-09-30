@@ -720,6 +720,8 @@ export default {
       fav: "Favorite (move to front)",
       unfav: "Unfavorite",
       categoryAll: "All",
+      categoryEmpty:
+        "No scenes in this category. Upload a background or move an existing scene here.",
       categoryNameEmpty: "Please enter a category name",
       categoryNamePlaceholder: "New category",
       categoryAdd: "Add Category",

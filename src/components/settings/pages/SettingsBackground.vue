@@ -7,11 +7,11 @@
       </template>
 
       <!-- 当前场景信息 + 操作按钮 -->
-      <div class="mb-4 flex items-center gap-3">
+      <div class="mb-4 flex flex-wrap items-center gap-3">
         <div class="text-brand font-bold">
           {{ $t("settings.background.scene.current") }}{{ currentSceneDisplay }}
         </div>
-        <div class="ml-auto flex gap-3">
+        <div class="ml-auto flex flex-wrap gap-2">
           <button
             class="bg-brand/80 border-brand hover:bg-brand rounded-full border px-5 py-1.5 text-sm font-bold text-white shadow-lg shadow-indigo-500/20 transition-all"
             @click="handleCreateScene"
@@ -55,57 +55,20 @@
         </div>
       </div>
 
-      <!-- 背景分类管理（子文件夹 = 子分类）：选项卡 + 新建 + 删除 -->
-      <div class="mb-4 flex flex-wrap items-center gap-2">
-        <button
-          class="rounded-full border px-3 py-1 text-xs font-semibold transition-all"
-          :class="
-            currentBackgroundCategory === '全部'
-              ? 'bg-brand/80 border-brand text-white'
-              : 'border-white/20 bg-white/10 text-white/70 hover:bg-white/20'
-          "
-          @click="currentBackgroundCategory = '全部'"
-        >
-          {{ $t("settings.background.scene.categoryAll") }}
-        </button>
-        <button
-          v-for="cat in backgroundCategories"
-          :key="cat"
-          class="rounded-full border px-3 py-1 text-xs font-semibold transition-all"
-          :class="
-            currentBackgroundCategory === cat
-              ? 'bg-brand/80 border-brand text-white'
-              : 'border-white/20 bg-white/10 text-white/70 hover:bg-white/20'
-          "
-          @click="currentBackgroundCategory = cat"
-        >
-          {{ cat }}
-        </button>
+      <SceneCategoryBar
+        v-model="currentBackgroundCategory"
+        v-model:name="newCategoryName"
+        :categories="backgroundCategories"
+        :busy="categoryBusy"
+        @create="handleCreateCategory"
+        @delete="handleDeleteCategoryFlow"
+      />
 
-        <!-- 新建分类 -->
-        <div class="flex items-center gap-1">
-          <input
-            v-model="newCategoryName"
-            :placeholder="$t('settings.background.scene.categoryNamePlaceholder')"
-            class="w-28 rounded-lg border border-white/15 bg-black/30 px-2 py-1 text-xs text-white focus:border-indigo-400 focus:outline-none"
-            @keyup.enter="handleCreateCategory"
-          />
-          <button
-            class="rounded-full border border-indigo-400 bg-indigo-500/80 px-2.5 py-1 text-xs font-semibold text-white hover:bg-indigo-500"
-            @click="handleCreateCategory"
-          >
-            {{ $t("settings.background.scene.categoryAdd") }}
-          </button>
-        </div>
-
-        <!-- 删除当前选中的分类（非"全部"时显示） -->
-        <button
-          v-if="currentBackgroundCategory !== '全部' && !isBackgroundCategoryReadOnly"
-          class="rounded-full border border-red-400/40 bg-red-500/20 px-2.5 py-1 text-xs font-semibold text-red-300 hover:bg-red-500/30"
-          @click="handleDeleteCategoryFlow"
-        >
-          {{ $t("settings.background.scene.categoryDelete") }}
-        </button>
+      <div
+        v-if="filteredScenes.length === 0"
+        class="mb-5 rounded-xl border border-dashed border-white/15 bg-white/5 px-6 py-10 text-center text-sm text-white/50"
+      >
+        {{ $t("settings.background.scene.categoryEmpty") }}
       </div>
 
       <!-- 场景卡片网格 -->
@@ -745,6 +708,8 @@ import {
   Cpu,
   Star,
 } from "lucide-vue-next";
+import SceneCategoryBar from "../background/SceneCategoryBar.vue";
+import { ALL_CATEGORY, ROOT_CATEGORY, VIRTUAL_CATEGORY } from "@/constants/background-categories";
 import SceneEditModal from "../scene/SceneEditModal.vue";
 import DialogAppearancePanel from "../dialog/DialogAppearancePanel.vue";
 import PluginTag from "@/components/ui/PluginTag.vue";
@@ -915,36 +880,23 @@ async function handleToggleFavorite(scene: SceneInfo): Promise<void> {
 
 // ── 背景分类（子文件夹）+ 场景过滤 ──
 const backgroundCategories = ref<string[]>([]);
-const currentBackgroundCategory = ref<string>("全部");
+const currentBackgroundCategory = ref<string>(ALL_CATEGORY);
 const newCategoryName = ref("");
-const VIRTUAL_CATEGORY = "插件";
+const categoryBusy = ref(false);
 const isBackgroundCategoryReadOnly = computed(
   () => currentBackgroundCategory.value === VIRTUAL_CATEGORY,
 );
 const writableBackgroundCategories = computed(() =>
-  backgroundCategories.value.filter((category) => category !== VIRTUAL_CATEGORY),
+  backgroundCategories.value.filter(
+    (category) => category !== VIRTUAL_CATEGORY && category !== ROOT_CATEGORY,
+  ),
 );
-
-// 场景的背景 → 所属分类 映射（url → category），用于按分类过滤场景卡片。
-// 先按完整 url 精确匹配；再按文件名（basename）兜底匹配，兼顾
-// 前后端对路径分隔符/大小写的表示差异，避免子分类标签下场景被误归为“根目录”。
-function categoryOfBackground(url: string): string {
-  if (!url) return "根目录";
-  const matched = backgroundList.value.find((b) => b.url === url);
-  if (matched?.category) return matched.category;
-  const base = (url.split(/[\\/]/).pop() || "").toLowerCase();
-  const byName = backgroundList.value.find((b) => {
-    const bBase = (b.url || "").split(/[\\/]/).pop() || "";
-    return bBase.toLowerCase() === base;
-  });
-  return byName?.category || "根目录";
-}
 
 // 收藏置顶排序后的完整场景列表（再按背景分类过滤）
 const orderedScenes = computed(() => applySceneOrder(scenes.value));
 // 按当前选中的背景分类过滤场景
 const filteredScenes = computed(() => {
-  if (!currentBackgroundCategory.value || currentBackgroundCategory.value === "全部") {
+  if (!currentBackgroundCategory.value || currentBackgroundCategory.value === ALL_CATEGORY) {
     return orderedScenes.value;
   }
   if (currentBackgroundCategory.value === VIRTUAL_CATEGORY) {
@@ -954,8 +906,7 @@ const filteredScenes = computed(() => {
   }
   return orderedScenes.value.filter((s) => {
     if (s.plugin_id || (s.source && s.source !== "game")) return false;
-    const bgPath = s.background || "";
-    return categoryOfBackground(bgPath) === currentBackgroundCategory.value;
+    return (s.category ?? ROOT_CATEGORY) === currentBackgroundCategory.value;
   });
 });
 
@@ -1213,12 +1164,12 @@ async function refreshBackground(): Promise<void> {
 async function loadBackgroundCategories(): Promise<void> {
   try {
     const cats = await listBackgroundCategories();
-    backgroundCategories.value = cats;
+    backgroundCategories.value = [ROOT_CATEGORY, ...cats.filter((cat) => cat !== ROOT_CATEGORY)];
     if (
-      currentBackgroundCategory.value !== "全部" &&
-      !cats.includes(currentBackgroundCategory.value)
+      currentBackgroundCategory.value !== ALL_CATEGORY &&
+      !backgroundCategories.value.includes(currentBackgroundCategory.value)
     ) {
-      currentBackgroundCategory.value = "全部";
+      currentBackgroundCategory.value = ALL_CATEGORY;
     }
   } catch (error) {
     console.error("加载背景分类失败", error);
@@ -1226,15 +1177,18 @@ async function loadBackgroundCategories(): Promise<void> {
 }
 
 async function handleCreateCategory(): Promise<void> {
+  if (categoryBusy.value) return;
   const name = newCategoryName.value.trim();
   if (!name) {
     await dialogStore.alert(t("settings.background.scene.categoryNameEmpty"));
     return;
   }
+  categoryBusy.value = true;
   try {
     await createBackgroundCategory(name);
     newCategoryName.value = "";
     await refreshBackground();
+    currentBackgroundCategory.value = name;
     await fetchScenes();
     uiStore.showSuccess({
       title: t("settings.background.scene.categoryCreated"),
@@ -1243,22 +1197,34 @@ async function handleCreateCategory(): Promise<void> {
     });
   } catch (error: any) {
     console.error("创建分类失败:", error);
-    await dialogStore.alert(t("settings.background.scene.categoryCreateFail"));
+    await dialogStore.alert(
+      `${t("settings.background.scene.categoryCreateFail")}\n${String(error)}`,
+    );
+  } finally {
+    categoryBusy.value = false;
   }
 }
 
 async function handleDeleteCategoryFlow(): Promise<void> {
   const cat = currentBackgroundCategory.value;
-  if (!cat || cat === "全部" || cat === VIRTUAL_CATEGORY) return;
-  const confirmed = await dialogStore.confirm(
-    t("settings.background.scene.categoryDeleteConfirmMove", { name: cat }),
-  );
-  if (!confirmed) return;
+  if (
+    categoryBusy.value ||
+    !cat ||
+    cat === ALL_CATEGORY ||
+    cat === ROOT_CATEGORY ||
+    cat === VIRTUAL_CATEGORY
+  )
+    return;
+  categoryBusy.value = true;
   try {
+    const confirmed = await dialogStore.confirm(
+      t("settings.background.scene.categoryDeleteConfirmMove", { name: cat }),
+    );
+    if (!confirmed) return;
     const result = await deleteBackgroundCategory(cat, "move_to_root");
     await refreshBackground();
     await fetchScenes();
-    currentBackgroundCategory.value = "全部";
+    currentBackgroundCategory.value = ALL_CATEGORY;
     uiStore.showSuccess({
       title: t("settings.background.scene.categoryDeleted"),
       message: t("settings.background.scene.categoryDeletedMoved", { name: cat, count: result }),
@@ -1266,7 +1232,11 @@ async function handleDeleteCategoryFlow(): Promise<void> {
     });
   } catch (error) {
     console.error("删除分类失败:", error);
-    await dialogStore.alert(t("settings.background.scene.categoryDeleteFail"));
+    await dialogStore.alert(
+      `${t("settings.background.scene.categoryDeleteFail")}\n${String(error)}`,
+    );
+  } finally {
+    categoryBusy.value = false;
   }
 }
 
@@ -1295,7 +1265,9 @@ async function handleFileUpload(event: Event): Promise<void> {
   try {
     const buf = await file.arrayBuffer();
     const category =
-      currentBackgroundCategory.value === "全部" ? undefined : currentBackgroundCategory.value;
+      currentBackgroundCategory.value === ALL_CATEGORY
+        ? undefined
+        : currentBackgroundCategory.value;
     await uploadBackgroundImage(fileName, new Uint8Array(buf), category);
     await refreshBackground();
     // 刷新场景列表（后端会自动将新背景注册为场景）
@@ -1332,7 +1304,7 @@ const overIndex = ref(-1);
 async function openSortModal(): Promise<void> {
   // 全局收藏与排序键是跨分类的，在子分类下保存会用当前子集覆盖全局，
   // 因此只允许在「全部」分类下调整全局排序。
-  if (currentBackgroundCategory.value !== "全部") {
+  if (currentBackgroundCategory.value !== ALL_CATEGORY) {
     await dialogStore.alert(t("settings.background.sort.onlyAll"));
     return;
   }
