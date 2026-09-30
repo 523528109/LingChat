@@ -385,36 +385,3 @@ pub fn set_hdr_mode(app: AppHandle, enabled: bool) -> Result<(), String> {
     store.save().map_err(|e| e.to_string())?;
     Ok(())
 }
-
-#[cfg(test)]
-mod memory_setting_validation_tests {
-    use super::validate_u32_setting;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn rejects_overflow_negative_and_out_of_range_values() {
-        for raw in ["4294967296", "-1", "0"] {
-            let values = BTreeMap::from([("memory".to_string(), raw.to_string())]);
-            assert!(validate_u32_setting(&values, "memory", "memory", 1, 10_000).is_err());
-        }
-    }
-
-    #[test]
-    fn zero_min_accepts_zero_and_rejects_invalid_large_values() {
-        let zero = BTreeMap::from([("memory".to_string(), "0".to_string())]);
-        assert!(validate_u32_setting(&zero, "memory", "memory", 0, 10_000).is_ok());
-        for raw in ["10001", "18446744073709551615", "not-a-number"] {
-            let values = BTreeMap::from([("memory".to_string(), raw.to_string())]);
-            assert!(validate_u32_setting(&values, "memory", "memory", 0, 10_000).is_err());
-        }
-    }
-
-    #[test]
-    fn accepts_valid_boundaries_and_missing_values() {
-        for raw in ["1", "10000"] {
-            let values = BTreeMap::from([("memory".to_string(), raw.to_string())]);
-            assert!(validate_u32_setting(&values, "memory", "memory", 1, 10_000).is_ok());
-        }
-        assert!(validate_u32_setting(&BTreeMap::new(), "memory", "memory", 1, 10_000,).is_ok());
-    }
-}

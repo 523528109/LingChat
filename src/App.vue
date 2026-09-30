@@ -1,5 +1,8 @@
 <template>
   <router-view />
+  <!-- 全局路由切换黑屏遮罩（详细说明见 useRouteFade）。
+       需留在 #app 内：useZoom 会在此挂 transform scale，fixed inset-0 才精确铺满窗口 -->
+  <RouteFadeMask />
   <!-- macOS 无边框窗口：顶部拖拽区（配合 Overlay 红绿灯）。仅在 macOS 主窗口挂载，
        其余窗口 / Windows / Linux / 移动端不渲染，避免影响既有拖动与点击。 -->
   <div v-if="isMacOverlayWindow" class="mac-drag-region" data-tauri-drag-region></div>
@@ -24,6 +27,7 @@ import { useRoute } from "vue-router";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useSettingsStore } from "./stores/modules/settings";
 import CursorEffects from "./components/effects/CursorEffects.vue";
+import RouteFadeMask from "./components/ui/RouteFadeMask.vue";
 import Notification from "./components/ui/Notification.vue";
 import AchievementToast from "./components/ui/AchievementToast.vue";
 import AdventureUnlockNotify from "./components/ui/AdventureUnlockNotify.vue";

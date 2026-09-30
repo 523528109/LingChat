@@ -15,6 +15,7 @@ import { i18n } from "./locales";
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import router from "./router";
+import { installRouteFade } from "./composables/app/useRouteFade";
 import { autoConfigurePerformance } from "./api/services/cpu-perf";
 import { initAudioOutputManager } from "./utils/audioOutputManager";
 
@@ -40,6 +41,9 @@ if (isCastWindow) {
 
 app.use(pinia);
 app.use(i18n);
+
+// 路由黑屏过渡守卫：必须早于 app.use(router) 触发的首次导航，且只注册一次
+installRouteFade(router);
 app.use(router);
 
 // 独立日志窗口：通过 index.html?window=log 打开时直接进入日志路由
