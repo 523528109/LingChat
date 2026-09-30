@@ -778,6 +778,10 @@ export default {
       mainMenuMeteors: "Enable meteor animation on the main menu",
       mouseTrail: "Enable global mouse trail animation",
       clickAnimation: "Enable click animation",
+      cursorEngine: {
+        ba: "Starglow FX (New)",
+        legacy: "Classic FX",
+      },
       sceneAwareness: "Enable scene awareness (triggers narration when switching scenes)",
       meteorFps: "Meteor FPS",
       starsFps: "Star FPS",

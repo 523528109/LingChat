@@ -743,6 +743,10 @@ export default {
       mainMenuMeteors: "啟用主界面流星動畫",
       mouseTrail: "啟用全局滑鼠滑動動畫",
       clickAnimation: "啟用撳掣動畫",
+      cursorEngine: {
+        ba: "星輝特效（新）",
+        legacy: "經典特效",
+      },
       sceneAwareness: "啟用場景感知（切換場景嗰陣觸發旁白）",
       meteorFps: "流星幀率 (FPS)",
       starsFps: "星星幀率 (FPS)",

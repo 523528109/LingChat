@@ -762,6 +762,10 @@ export default {
       mainMenuMeteors: "メイン画面の流星アニメーションを有効化",
       mouseTrail: "マウス軌跡アニメーションを有効化（グローバル）",
       clickAnimation: "クリックアニメーションを有効化",
+      cursorEngine: {
+        ba: "星の輝きエフェクト（新）",
+        legacy: "クラシックエフェクト",
+      },
       sceneAwareness: "シーン感知を有効化（シーン切替時にナレーションを発生）",
       meteorFps: "流星フレームレート (FPS)",
       starsFps: "星フレームレート (FPS)",

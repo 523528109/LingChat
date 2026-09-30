@@ -3,9 +3,10 @@
   <!-- macOS 无边框窗口：顶部拖拽区（配合 Overlay 红绿灯）。仅在 macOS 主窗口挂载，
        其余窗口 / Windows / Linux / 移动端不渲染，避免影响既有拖动与点击。 -->
   <div v-if="isMacOverlayWindow" class="mac-drag-region" data-tauri-drag-region></div>
-  <!-- 将光标特效 teleport 到 body，避免 #app 上的整体缩放（transform: scale）导致坐标偏移 -->
+  <!-- 内置光标特效：teleport 到 body，避免 #app 上的整体缩放（transform: scale）导致坐标偏移。
+       默认走 useCursorFx（ba-click-fx，覆盖层由库自己挂在 body 下），仅在选择内置实现时挂载 -->
   <Teleport to="body">
-    <CursorEffects />
+    <CursorEffects v-if="legacyCursorFxActive" />
   </Teleport>
 
   <!-- 全局通知组件（直接从 uiStore 读取状态） -->
@@ -18,8 +19,10 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from "vue";
 import { useRoute } from "vue-router";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useSettingsStore } from "./stores/modules/settings";
 import CursorEffects from "./components/effects/CursorEffects.vue";
 import Notification from "./components/ui/Notification.vue";
 import AchievementToast from "./components/ui/AchievementToast.vue";
@@ -32,6 +35,7 @@ import { useSedentaryReminder } from "./composables/useSedentaryReminder";
 import { useAppBootstrap } from "./composables/app/useAppBootstrap";
 import { useCastMirror } from "./composables/app/useCastMirror";
 import { useCloseConfirm } from "./composables/app/useCloseConfirm";
+import { cursorFxBaAvailable, useCursorFx } from "./composables/app/useCursorFx";
 import { useDevToolsVisibility } from "./composables/app/useDevToolsVisibility";
 import { useFullscreenHotkey } from "./composables/app/useFullscreenHotkey";
 import { useGlobalFont } from "./composables/app/useGlobalFont";
@@ -42,7 +46,15 @@ const route = useRoute();
 // 仅主窗口挂载全局弹窗（通知/成就/对话确认），日志窗口等复用 App.vue 的窗口不弹
 const isMainWindow = getCurrentWindow().label === "main";
 
+const settingsStore = useSettingsStore();
+// 选到内置实现，或新版引擎初始化失败时，回退到内置的 Canvas2D 特效
+const legacyCursorFxActive = computed(
+  () => settingsStore.cursorEffectEngine === "legacy" || !cursorFxBaAvailable.value,
+);
+
 // ─── 全局单例 composables（仅在此处调用一次以激活）──────────
+// 光标特效（新版，库自带 body 覆盖层）
+useCursorFx();
 // 激活主动对话投放条件上报
 useCanDeliver();
 // 激活 Ctrl+滚轮 UI 全局缩放

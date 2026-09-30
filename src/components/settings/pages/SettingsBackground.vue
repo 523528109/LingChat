@@ -449,6 +449,22 @@
         >
           {{ $t("settings.background.animation.clickAnimation") }}
         </Toggle>
+        <div class="flex items-center gap-2">
+          <Button
+            type="big"
+            :active="cursorEffectEngine === 'ba-click-fx'"
+            @click="settingsStore.setCursorEffectEngine('ba-click-fx')"
+          >
+            {{ $t("settings.background.animation.cursorEngine.ba") }}
+          </Button>
+          <Button
+            type="big"
+            :active="cursorEffectEngine === 'legacy'"
+            @click="settingsStore.setCursorEffectEngine('legacy')"
+          >
+            {{ $t("settings.background.animation.cursorEngine.legacy") }}
+          </Button>
+        </div>
         <Toggle
           :checked="sceneAwarenessEnabled"
           @change="settingsStore.setSceneAwarenessEnabled($event)"
@@ -761,6 +777,7 @@ const mainMenuStarsEnabled = computed(() => settingsStore.mainMenuStarsEnabled);
 const mainMenuMeteorsEnabled = computed(() => settingsStore.mainMenuMeteorsEnabled);
 const globalMouseTrailEnabled = computed(() => settingsStore.globalMouseTrailEnabled);
 const clickAnimationEnabled = computed(() => settingsStore.clickAnimationEnabled);
+const cursorEffectEngine = computed(() => settingsStore.cursorEffectEngine);
 const sceneAwarenessEnabled = computed(() => settingsStore.sceneAwarenessEnabled);
 const hdrModeEnabled = computed(() => settingsStore.hdrModeEnabled);
 const currentParticle = computed(() => settingsStore.backgroundEffect);

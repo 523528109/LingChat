@@ -55,6 +55,7 @@ export const DEFAULT_SETTINGS = {
     mainMenuMeteorsEnabled: true, // 主菜单流星开关
     globalMouseTrailEnabled: true, // 全局鼠标滑动动画开关
     clickAnimationEnabled: true, // 点击动画开关
+    cursorEffectEngine: "ba-click-fx" as CursorEffectEngine, // 光标特效引擎：新版 WebGL2 / 旧 Canvas2D 实现
     meteorFps: 30, // 流星动画帧率
     starsFps: 30, // 星星动画帧率
     sceneAwarenessEnabled: true, // 场景感知开关
@@ -118,6 +119,14 @@ export interface AudioSettings {
   spectrumColor1: string;
   spectrumColor2: string;
 }
+/**
+ * 光标特效引擎。
+ *
+ * `ba-click-fx` = 第三方库实现（WebGL2，性能更好，默认）；
+ * `legacy` = 内置的 Canvas2D 实现（src/components/effects/CursorEffects.vue）。
+ */
+export type CursorEffectEngine = "ba-click-fx" | "legacy";
+
 export interface DisplaySettings {
   currentBackground: string;
   backgroundEffect: string;
@@ -125,6 +134,7 @@ export interface DisplaySettings {
   mainMenuMeteorsEnabled: boolean;
   globalMouseTrailEnabled: boolean;
   clickAnimationEnabled: boolean;
+  cursorEffectEngine: CursorEffectEngine;
   meteorFps: number;
   starsFps: number;
   sceneAwarenessEnabled: boolean;
@@ -209,6 +219,9 @@ export const useSettingsStore = defineStore("settings", {
     mainMenuMeteorsEnabled: (state) => state.display.mainMenuMeteorsEnabled,
     globalMouseTrailEnabled: (state) => state.display.globalMouseTrailEnabled,
     clickAnimationEnabled: (state) => state.display.clickAnimationEnabled,
+    // 光标特效引擎（旧持久化数据缺该字段时回退新版）
+    cursorEffectEngine: (state): CursorEffectEngine =>
+      state.display.cursorEffectEngine ?? "ba-click-fx",
     meteorFps: (state) => state.display.meteorFps,
     starsFps: (state) => state.display.starsFps,
     sceneAwarenessEnabled: (state) => state.display.sceneAwarenessEnabled,
@@ -377,6 +390,10 @@ export const useSettingsStore = defineStore("settings", {
     // 设置点击动画开关
     setClickAnimationEnabled(enabled: boolean) {
       this.display.clickAnimationEnabled = enabled;
+    },
+    // 设置光标特效引擎
+    setCursorEffectEngine(engine: CursorEffectEngine) {
+      this.display.cursorEffectEngine = engine;
     },
 
     // 设置流星动画帧率
