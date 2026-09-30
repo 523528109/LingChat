@@ -188,6 +188,19 @@ export interface AsrStatus {
 
 export const asrGetStatus = () => invoke<AsrStatus>("asr_get_status");
 
+/** 全局快捷键注册状态（`asr:ptt-global-status` 事件载荷的判别字段）。
+ *
+ * 三态必须分清：`inactive`（开关关 / 不在聊天界面）是**正常状态**，不应提示；
+ * 只有 `failed` 才是真失败。历史上后端用单个 `ok: boolean` 同时表达这两者，
+ * 关闭开关时设置页会误报「全局快捷键注册失败：」（reason 为空）。 */
+export type PttGlobalState = "registered" | "inactive" | "failed";
+
+export interface PttGlobalStatus {
+  state: PttGlobalState;
+  /** 仅 `failed` 时非空：注册失败的原因。 */
+  reason: string;
+}
+
 /** 全局快捷键界面门控（仅 /chat 与 /pet 激活）：离开界面注销释放键位
  *  （OS 级注册会拦截其它应用的同键输入），回界面按设置重注册。移动端 no-op。 */
 export const asrPttGlobalSetActive = (active: boolean) =>

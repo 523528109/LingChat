@@ -47,11 +47,49 @@ pub struct PttGlobalEvent {
     pub state: &'static str,
 }
 
-/// 全局注册状态事件（仅失败时 emit，设置页显示原因；开关不自动回退）。
-#[derive(serde::Serialize, Clone)]
+/// 全局快捷键的注册状态（`asr:ptt-global-status` 事件载荷的判别字段）。
+///
+/// **必须把「未启用」与「注册失败」分开**：两者都不是"已注册"，但只有后者该
+/// 给用户报错。历史上这里只有一个 `ok: bool`，两种语义挤在一起，设置页无从
+/// 分辨 —— 关闭开关时走正常注销路径（`reason` 为空），却被渲染成
+/// 「全局快捷键注册失败：」（冒号后无内容）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PttGlobalState {
+    /// 已按当前设置成功注册（窗口内监听退位，由全局事件驱动）。
+    Registered,
+    /// 未启用：开关关，或界面门控未激活。**正常状态，不应报错。**
+    Inactive,
+    /// 注册失败（键被占用 / 插件不支持该键），原因见 `reason`。
+    Failed,
+}
+
+/// 全局注册状态事件（设置页据此提示、PTT 据此决定窗口内监听是否退位）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PttGlobalStatus {
-    pub ok: bool,
+    pub state: PttGlobalState,
     pub reason: String,
+}
+
+/// 由 `sync` / `set_active` 的结果与当前设置推导要上报的状态。
+///
+/// 两个调用点（设置保存、界面门控激活）共用这一套判定 —— 任一处单独手写
+/// 状态构造，都可能再次造出「关开关上报失败」这类契约漂移。
+pub fn status_from(result: Result<(), String>, ptt_global: bool) -> PttGlobalStatus {
+    match result {
+        Err(reason) => PttGlobalStatus {
+            state: PttGlobalState::Failed,
+            reason,
+        },
+        Ok(()) if ptt_global => PttGlobalStatus {
+            state: PttGlobalState::Registered,
+            reason: String::new(),
+        },
+        Ok(()) => PttGlobalStatus {
+            state: PttGlobalState::Inactive,
+            reason: String::new(),
+        },
+    }
 }
 
 /// 按当前设置同步全局快捷键注册状态（幂等）：
@@ -262,5 +300,37 @@ mod tests {
             binding_to_hotkey_str(r#"{"key":"f8","ctrl":false,"alt":false}"#).as_deref(),
             Some("F8")
         );
+    }
+
+    #[test]
+    fn disabled_reports_inactive_not_failure() {
+        // 关闭「失去焦点快捷键可用」开关：sync 正常注销并返回 Ok ——
+        // 必须上报 Inactive（正常状态），绝不能是 Failed，否则设置页会把
+        // 「关闭」渲染成「全局快捷键注册失败：」（reason 为空，冒号后没内容）。
+        let status = status_from(Ok(()), false);
+        assert_eq!(status.state, PttGlobalState::Inactive);
+        assert!(status.reason.is_empty());
+    }
+
+    #[test]
+    fn disabled_gate_reports_inactive_not_failure() {
+        // 与上一条同类的第二条路径：开关本就关着，从前端回到聊天界面触发门控
+        // 激活时，sync 同样返回 Ok —— 也不该被当成失败上报。
+        let status = status_from(Ok(()), false);
+        assert_ne!(status.state, PttGlobalState::Failed);
+    }
+
+    #[test]
+    fn enabled_success_reports_registered() {
+        let status = status_from(Ok(()), true);
+        assert_eq!(status.state, PttGlobalState::Registered);
+        assert!(status.reason.is_empty());
+    }
+
+    #[test]
+    fn registration_error_reports_failed_with_reason() {
+        let status = status_from(Err("键被占用".into()), true);
+        assert_eq!(status.state, PttGlobalState::Failed);
+        assert_eq!(status.reason, "键被占用");
     }
 }

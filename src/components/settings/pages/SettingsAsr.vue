@@ -339,6 +339,7 @@ import type {
   ProviderInfo,
   AsrRegionInfo,
   ProviderConfig,
+  PttGlobalStatus,
 } from "@/api/services/asr";
 
 const { t, te } = useI18n();
@@ -417,18 +418,19 @@ function resetPttKey() {
   localSettings.value.ptt_key = '{"key":"f8"}';
 }
 
-/** 全局快捷键注册失败提示（后端 asr:ptt-global-status 仅在失败时 emit；开关不自动回退） */
+/** 全局快捷键注册失败提示（后端按 state 判别；只有 failed 才提示，开关不自动回退） */
 const pttGlobalError = ref("");
 let unlistenGlobalStatus: (() => void) | null = null;
 onMounted(async () => {
-  unlistenGlobalStatus = await listen<{ ok: boolean; reason: string }>(
-    "asr:ptt-global-status",
-    (e) => {
-      if (!e.payload.ok) {
-        pttGlobalError.value = t("settings.asr.pttGlobalError", { reason: e.payload.reason });
-      }
-    },
-  );
+  unlistenGlobalStatus = await listen<PttGlobalStatus>("asr:ptt-global-status", (e) => {
+    // 只有真正注册失败才提示。`inactive`（关闭开关 / 不在聊天界面）是正常状态
+    // 且 reason 为空 —— 按「非 ok 即失败」判断会把它渲染成「全局快捷键注册失败：」。
+    // 非失败时置空，顺带让关闭开关后残留的旧提示消失。
+    pttGlobalError.value =
+      e.payload.state === "failed"
+        ? t("settings.asr.pttGlobalError", { reason: e.payload.reason })
+        : "";
+  });
 });
 
 onUnmounted(() => {
@@ -785,7 +787,7 @@ watch(
     // 置位后用户的实际修改才走保存。
     if (!initialized) return;
     // 用户改动设置：旧注册失败提示不再相关，清除（保存后若仍失败，
-    // asr:ptt-global-status 事件会重新显示新原因——后端仅在失败时 emit）
+    // asr:ptt-global-status 事件会带 state=failed 重新显示新原因）
     pttGlobalError.value = "";
     if (saveTimer !== null) clearTimeout(saveTimer);
     saveTimer = window.setTimeout(() => {

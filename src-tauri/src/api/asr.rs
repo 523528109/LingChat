@@ -434,39 +434,22 @@ pub async fn asr_set_settings(
     // 全局快捷键同步（仅桌面）：开关开 → 注册 ptt_key 映射的组合串，关 → 注销。
     // 注册失败（键被占用/插件不支持）：保存本身已成功，**不返回 Err**——返回 Err
     // 会让前端 store 不提交（与落盘文件分叉），且错误可见性已由 emit 状态事件
-    // 承担（设置页红字提示，审查中危 2）。成功也 emit ok:true 供前端复位
-    // pttGlobalOk（窗口内退位判断用实际注册状态，防重启后注册失败的双重失效）。
+    // 承担（设置页红字提示，审查中危 2）。
+    //
+    // 三种结果都上报（registered / inactive / failed）：前端既要据此提示用户，
+    // 也要据此决定窗口内 keydown 是否退位（pttGlobalOk）。状态判别集中在
+    // `global_hotkey::status_from` —— 此前三个分支各自手写 ok/reason，「已注销」
+    // 与「注册失败」共用 ok:false，关闭开关时设置页误报「注册失败」。
     #[cfg(desktop)]
-    if let Err(e) = global_hotkey::sync(&app, &settings) {
-        tracing::warn!("[ASR] 全局快捷键注册失败: {e}");
+    {
+        let result = global_hotkey::sync(&app, &settings);
+        if let Err(e) = &result {
+            tracing::warn!("[ASR] 全局快捷键注册失败: {e}");
+        }
         let _ = app.emit_to(
             "main",
             "asr:ptt-global-status",
-            global_hotkey::PttGlobalStatus {
-                ok: false,
-                reason: e.clone(),
-            },
-        );
-    } else if settings.ptt_global {
-        let _ = app.emit_to(
-            "main",
-            "asr:ptt-global-status",
-            global_hotkey::PttGlobalStatus {
-                ok: true,
-                reason: String::new(),
-            },
-        );
-    } else {
-        // 注销成功（ptt_global=false）也复位前端 pttGlobalOk：此前残留 true
-        // 会让 blur 兜底误退位（keydown 退位条件虽已含设置值，彻底闭环防
-        // 残留状态误导后续判别）
-        let _ = app.emit_to(
-            "main",
-            "asr:ptt-global-status",
-            global_hotkey::PttGlobalStatus {
-                ok: false,
-                reason: String::new(),
-            },
+            global_hotkey::status_from(result, settings.ptt_global),
         );
     }
     Ok(())
@@ -604,16 +587,8 @@ pub async fn asr_ptt_global_set_active(app: AppHandle, active: bool) -> Result<(
         // 否则双源触发 toggle）。门控关闭（设置页打开）不上报——设置页监听
         // 该事件提示失败，门控关闭时"未注册"是预期状态，上报会造成误报。
         if active {
-            let status = match &result {
-                Ok(()) => global_hotkey::PttGlobalStatus {
-                    ok: settings.ptt_global,
-                    reason: String::new(),
-                },
-                Err(e) => global_hotkey::PttGlobalStatus {
-                    ok: false,
-                    reason: e.clone(),
-                },
-            };
+            // 与 asr_set_settings 共用同一套状态判别（见 status_from 的说明）
+            let status = global_hotkey::status_from(result.clone(), settings.ptt_global);
             let _ = app.emit_to("main", "asr:ptt-global-status", status);
         }
         result
