@@ -214,6 +214,7 @@
     :role-id="id"
     :title="name"
     :source="source"
+    :clothes="clothes"
     @close="closeSettingsModal"
     @saved="handleSettingsSaved"
   />

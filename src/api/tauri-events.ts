@@ -547,8 +547,6 @@ export function initializeCastWindowListeners() {
   });
 
   // 投屏客户端麦克风经投屏 /ws 送到 Rust ASR，识别文本由这里注入对话。
-  // 复用既有 asr-send 自定义事件 → GameDialog.onAsrAutoSend → send()（sendMessage）。
-  // 仅投屏窗口注册此监听（主窗口不注册），保证每次识别恰好注入一次。
   listen("cast:mic:recognized", (event) => {
     const { text } = event.payload as { text: string };
     if (!text) return;

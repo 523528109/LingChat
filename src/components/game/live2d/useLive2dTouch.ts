@@ -75,9 +75,9 @@ const REACTION_SWAY_THRESHOLD = 0.06;
 /** 上一条的兜底上限，只是给动作排期，不是用计时器去猜动作播完没有 */
 const REACTION_DELAY_LIMIT_MS = 900;
 
-/** 启发式黑名单：监听挂在 window 上，会连带吃到输入框、按钮与对话框的拖拽 */
+/** 启发式黑名单：监听挂在 window 上，会连带吃到输入框、按钮、对话框与设置界面的拖拽 */
 const INTERACTIVE_SELECTOR =
-  "input, textarea, select, button, a, [contenteditable='true'], .game-dialog";
+  "input, textarea, select, button, a, [contenteditable='true'], .game-dialog, .settings-panel";
 
 export function createTouchSession(host: TouchHost): TouchSession {
   const stroke = createStrokeTracker();
