@@ -146,7 +146,7 @@ async fn recognize(app: &AppHandle, pcm: &[f32]) -> Result<String, String> {
         .try_lock()
         .map_err(|_| "正在识别中，请稍后再试".to_string())?;
 
-    // 不带热词：本条链路尚无角色上下文，走 provider 配置级热词兜底
+    // 不带热词：本条链路尚无角色上下文
     let opts = AsrOptions::default();
     let result = session
         .recognize_wav(provider_id.clone(), wav, &opts)

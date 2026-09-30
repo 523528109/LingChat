@@ -493,7 +493,7 @@ const serviceGroups = computed<{ provider: ProviderInfo; items: ServiceItem[] }[
   }),
 );
 
-// ProviderConfig 是后端约定的具名键（api_key / endpoint / extra），
+// ProviderConfig 是后端约定的具名键（api_key / endpoint / model / region），
 // 而 config_field.key 是动态字符串，需要做 Record 桥接才能用 v-model 写入任意键。
 // 只读：写路径走 ensureProviderConfig + debounce save。
 //

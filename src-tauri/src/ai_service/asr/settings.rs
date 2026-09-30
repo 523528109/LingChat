@@ -25,7 +25,7 @@ pub enum SendMode {
     AutoSend,
 }
 
-/// 单个 provider 的配置：API key + 端点 + 模型 + 地域 + 热词 + 任意额外字段。
+/// 单个 provider 的配置：API key + 端点 + 模型 + 地域。
 ///
 /// **新增字段必须同步加到这里**：设置页把 `config_fields[].key` 写成顶层键
 /// （`providerCfgRecord[field.key]`），而本结构没有 `deny_unknown_fields`
@@ -55,8 +55,6 @@ pub struct ProviderConfig {
     /// DashScope 地域 id（见 [`DashScopeRegion`]）；空/未知 = 默认地域。
     #[serde(default)]
     pub region: String,
-    #[serde(default)]
-    pub extra: HashMap<String, String>,
 }
 
 impl ProviderConfig {

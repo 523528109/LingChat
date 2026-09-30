@@ -76,6 +76,49 @@ pub(crate) fn hotwords_to_vocabulary_json(hotwords: &[Hotword]) -> JsonValue {
     JsonValue::Object(map)
 }
 
+/// 构造同步端点（multimodal-generation）的请求体。
+///
+/// 该端点的 `parameters` 只有 format / sample_rate / vocabulary（无 language_hints）。
+/// 热词在此门控：仅 qwen-audio-3.x 系支持 `vocabulary`，对其余模型发它很可能直接 400。
+fn build_batch_body(model: &str, data_url: &str, hotwords: &[Hotword]) -> JsonValue {
+    // 音频内容格式按模型分流：qwen-audio-3.x 系用 input_audio；历史 Fun-ASR-Realtime
+    // 用旧格式 audio。一刀切会让老配置从「能用」变成「未知错误」。
+    let legacy = qwen_uses_legacy_audio_content(model);
+    let audio_content = if legacy {
+        json!({ "audio": data_url })
+    } else {
+        json!({ "type": "input_audio", "input_audio": { "data": data_url } })
+    };
+    let mut body = json!({
+        "model": model,
+        "input": {
+            "messages": [{
+                "role": "user",
+                "content": [audio_content]
+            }]
+        },
+        "parameters": {
+            "format": "wav",
+            "sample_rate": 16000
+        }
+    });
+    if legacy {
+        // 旧协议实测带这个字段；新协议按官方示例不带
+        body["resources"] = json!([]);
+    }
+    if !hotwords.is_empty() {
+        if qwen_supports_inline_vocabulary(model) {
+            body["parameters"]["vocabulary"] = hotwords_to_vocabulary_json(hotwords);
+        } else {
+            warn!(
+                "[ASR] 模型 {model} 不支持即时热词，已忽略 {} 条热词（如需热词请改用 qwen-audio-3.x 系）",
+                hotwords.len()
+            );
+        }
+    }
+    body
+}
+
 #[async_trait]
 impl AsrProvider for QwenAsrProvider {
     fn id(&self) -> &'static str {
@@ -102,50 +145,9 @@ impl AsrProvider for QwenAsrProvider {
     ) -> Result<AsrResult, AsrError> {
         let endpoint = self.cred.effective_http_endpoint();
         let model = self.effective_batch_model();
-        // 同步端点未定义 language_hints 参数（文档的 parameters 只有
-        // format / sample_rate / vocabulary），保持不发送。
         let b64 = BASE64_STD.encode(&wav_bytes);
         let data_url = format!("data:audio/wav;base64,{b64}");
-        // 音频内容格式按模型分流：qwen-audio-3.x 系要求
-        // `{"type":"input_audio","input_audio":{"data":...}}`；历史 Fun-ASR-Realtime
-        // 走旧格式 `{"audio": ...}`。一刀切替换会让老配置从「能用」变成「未知错误」。
-        let legacy = qwen_uses_legacy_audio_content(model);
-        let audio_content = if legacy {
-            json!({ "audio": data_url })
-        } else {
-            json!({ "type": "input_audio", "input_audio": { "data": data_url } })
-        };
-        let mut body = json!({
-            "model": model,
-            "input": {
-                "messages": [{
-                    "role": "user",
-                    "content": [audio_content]
-                }]
-            },
-            "parameters": {
-                "format": "wav",
-                "sample_rate": 16000
-            }
-        });
-        if legacy {
-            // 旧协议实测带这个字段；新协议按官方示例不带
-            body["resources"] = json!([]);
-        }
-
-        // 即时热词：文档明确仅 qwen-audio-3.x 系支持，对 fun-asr-realtime /
-        // paraformer 系发这个参数很可能直接 400 —— 必须门控而非「有热词就发」。
-        let hotwords = &opts.hotwords;
-        if !hotwords.is_empty() {
-            if qwen_supports_inline_vocabulary(model) {
-                body["parameters"]["vocabulary"] = hotwords_to_vocabulary_json(hotwords);
-            } else {
-                warn!(
-                    "[ASR] 模型 {model} 不支持即时热词，已忽略 {} 条热词（如需热词请改用 qwen-audio-3.x 系）",
-                    hotwords.len()
-                );
-            }
-        }
+        let body = build_batch_body(model, &data_url, &opts.hotwords);
 
         let resp = self
             .http
@@ -179,7 +181,8 @@ impl AsrProvider for QwenAsrProvider {
 
         Ok(AsrResult {
             text,
-            language: opts.language_hint.clone(),
+            // 同步端点既不返回语言也不接受 language_hints：回填 hint 会伪造一个没人检测过的值
+            language: None,
             confidence: None,
             provider_id: Self::ID.into(),
         })
@@ -293,5 +296,47 @@ mod tests {
         assert_eq!(v["张三"], 5);
         assert_eq!(v["李四"], 50);
         assert_eq!(v.as_object().unwrap().len(), 2);
+    }
+
+    const DATA_URL: &str = "data:audio/wav;base64,AAAA";
+
+    #[test]
+    fn batch_body_carries_vocabulary_for_supported_model() {
+        let body = build_batch_body(
+            "qwen-audio-3.0-asr-flash",
+            DATA_URL,
+            &[Hotword::with_weight("张三", 5)],
+        );
+        assert_eq!(body["parameters"]["vocabulary"]["张三"], 5);
+    }
+
+    #[test]
+    fn batch_body_gates_vocabulary_by_model() {
+        // 不支持即时热词的模型：发这个字段很可能直接 400，必须门控掉
+        let body = build_batch_body("fun-asr-realtime", DATA_URL, &[Hotword::new("张三")]);
+        assert!(body["parameters"].get("vocabulary").is_none());
+    }
+
+    #[test]
+    fn batch_body_omits_vocabulary_without_hotwords() {
+        let body = build_batch_body("qwen-audio-3.0-asr-flash", DATA_URL, &[]);
+        assert!(body["parameters"].get("vocabulary").is_none());
+    }
+
+    #[test]
+    fn batch_body_audio_format_follows_model() {
+        let new_fmt = build_batch_body("qwen-audio-3.0-asr-flash", DATA_URL, &[]);
+        assert_eq!(
+            new_fmt["input"]["messages"][0]["content"][0]["type"],
+            "input_audio"
+        );
+        assert!(new_fmt.get("resources").is_none());
+
+        let legacy = build_batch_body("fun-asr-realtime", DATA_URL, &[]);
+        assert_eq!(
+            legacy["input"]["messages"][0]["content"][0]["audio"],
+            DATA_URL
+        );
+        assert!(legacy["resources"].is_array());
     }
 }

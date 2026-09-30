@@ -10,7 +10,8 @@ use serde::Serialize;
 pub struct AsrResult {
     /// 识别出的文本。
     pub text: String,
-    /// provider 报告的语言代码（可选）。
+    /// provider **检测到**的语言；拿不到时为 `None`（如 qwen 同步端不返回）。
+    /// 不要把入参的 `language_hint` 回填进来。
     pub language: Option<String>,
     /// provider 报告的置信度 0~1（可选）。
     pub confidence: Option<f32>,
@@ -73,11 +74,7 @@ pub struct AsrOptions {
     /// 可选 BCP-47 语言码，如 `"zh"` / `"en"` / `"ja"`。
     pub language_hint: Option<String>,
     /// **按调用传入**的热词（未来 = 当前角色的热词，随角色切换而变）。
-    ///
-    /// 非空时**覆盖** provider 配置级热词（`ProviderCredentials::hotwords`）；
-    /// 空时回退到配置级。合并规则集中在
-    /// [`ProviderCredentials::effective_hotwords`]，各 provider 不再自行判断
-    /// —— 后续接入角色级热词时无需改动任何 provider。
+    /// 空 = 无热词；没有配置级回退（`4fed1124` 已移除）。
     pub hotwords: Vec<Hotword>,
 }
 

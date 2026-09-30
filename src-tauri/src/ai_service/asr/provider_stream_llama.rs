@@ -23,7 +23,7 @@ use reqwest::multipart::Form;
 use std::sync::Arc;
 use tracing::debug;
 
-use super::error::AsrError;
+use super::error::{AsrError, map_reqwest_error};
 use super::provider::{AsrResult, ProviderCredentials, parse_llama_text};
 
 /// SSE 帧解析结果。
@@ -200,24 +200,6 @@ pub async fn recognize_stream(
         confidence: None,
         provider_id: "llama-asr".into(),
     })
-}
-
-/// 把 `reqwest::Error` 映射成 [`AsrError`]（与 provider.rs 同款）。
-fn map_reqwest_error(e: reqwest::Error) -> AsrError {
-    if e.is_timeout() {
-        AsrError::ProviderTimeout("network".into())
-    } else if e.is_connect() || e.is_request() {
-        AsrError::ProviderApiError {
-            provider: "network".into(),
-            message: format!("请求失败: {e}"),
-        }
-    } else {
-        tracing::warn!("reqwest 错误: {e}");
-        AsrError::ProviderApiError {
-            provider: "network".into(),
-            message: format!("{e}"),
-        }
-    }
 }
 
 #[cfg(test)]

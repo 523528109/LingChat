@@ -30,7 +30,6 @@ export interface ProviderConfig {
   region?: string;
   // 热词不在这里：热词逐角色（存数据库），按调用经识别命令的 `hotwords`
   // 参数传入，见下方 HotwordInput。
-  extra?: Record<string, string>;
 }
 
 /** 模型对应的端点类型：选中该模型时把对应端点字段填成当前地域的默认值 */
