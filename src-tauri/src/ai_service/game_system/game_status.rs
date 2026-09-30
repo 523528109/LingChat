@@ -127,6 +127,25 @@ impl GameStatus {
         Ok(())
     }
 
+    /// 把台词插入到第 `index` 条之前（下标基于 `line_list`，越界夹到末尾），
+    /// 用于把内容挂到「较近但非最新」的位置
+    pub async fn insert_line(
+        &mut self,
+        db: &DatabaseConnection,
+        index: usize,
+        line: LineBase,
+    ) -> Result<()> {
+        let perceived: Vec<i32> = self.present_role_ids.iter().copied().collect();
+        let game_line = GameLine::from_base(line, perceived);
+        // 中段插入会平移其后的下标，先让进行中的后台摘要作废，避免过期结果落库
+        //（与工具消息回填、edit_context_lines 的处理一致）。
+        self.role_manager.invalidate_memory_history();
+        self.line_list
+            .insert(index.min(self.line_list.len()), game_line);
+        self.refresh_memories(db).await?;
+        Ok(())
+    }
+
     pub async fn refresh_memories(&mut self, db: &DatabaseConnection) -> Result<()> {
         self.role_manager
             .sync_memories(db, &self.line_list, None)

@@ -297,13 +297,18 @@ impl Tool for UpdateAffection {
         let line = LineBase {
             content: PromptRole::Narrator.build_prompt(&text),
             attribute: LineAttributeExt(LineAttribute::User),
-            // sender_role_id=0 标记为玩家侧消息，与记忆构建器对齐
-            // （System 属性会被记忆构建器去重丢弃，切勿使用）
             sender_role_id: Some(0),
             display_name: Some("系统".to_string()),
             ..Default::default()
         };
-        if let Err(e) = gs.add_line(&state.db, line).await {
+        // 插到玩家最近一次发言之后，而不是追加到末尾：评估在整轮回复结束后才跑，
+        // 此时末尾已经是助手回复，追加会让人误以为变化是助手那几句话引发的。
+        let insert_at = gs
+            .line_list
+            .iter()
+            .rposition(|l| matches!(l.attribute(), LineAttribute::User))
+            .map_or(gs.line_list.len(), |i| i + 1);
+        if let Err(e) = gs.insert_line(&state.db, insert_at, line).await {
             tracing::warn!("[Affection] 写入好感度旁白台词失败: {e:#}");
         }
 
